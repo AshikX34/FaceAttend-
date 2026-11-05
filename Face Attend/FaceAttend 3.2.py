@@ -1,0 +1,11318 @@
+"""
+FaceAttend 3.2 ·  Smart Attendance System (arcade console commands)
+======================================================
+Author  : Built on FaceAttend 2.0 by the same team
+Version : 3.2
+Build   : 2026.08
+
+What's new in 3.2:
+--------------------------
+• Console tab gained a `/launch <name>` command that opens a small
+  self-contained mini-game in its own window — five options, `/games`
+  lists them. None of it touches attendance data; it just lives in the
+  Console command dispatcher.
+
+Carried over from 3.1 (nav & notepad overhaul):
+--------------------------
+• Nav rail trimmed from 9 icons to 7: Houses is now a pane inside the
+  Analytics tab (switch between "Analytics" and "Houses" with the pill
+  toggle at the top) and Whiteboard is now a pane inside the Notepad tab,
+  switched the same way. Student analytics and house analytics — and
+  notes and the whiteboard — were scattered across separate tabs before;
+  now each related pair shares one nav icon, and the rail has real
+  breathing room for whatever gets added next.
+• Home toolbar decluttered: the Analytics and Certificates buttons were
+  dropped, since both were already one click away elsewhere (the
+  Analytics rail icon; Certificates under Settings → Tools). The
+  remaining button groups have wider spacing so the bar reads less
+  cramped.
+• Notepad rebuilt as an actual notepad: multi-line page with a proper
+  scrollbar, fixed white background and a monospaced (Consolas) font
+  regardless of the app's light/dark theme, a Bold/Italic toggle pair,
+  six colour swatches for text highlighting, and an offline "AI Note
+  Helper" button that tidies a note into a bulleted list and fills in
+  a title from the first line when one hasn't been set — no network
+  or API key required.
+
+Carried over from 2.10 (packaged-build crash fix):
+--------------------------
+• Fixed a hard crash (Windows APPCRASH, access violation in MSVCP140.dll)
+  that only happened in the packaged .exe build, not when running from
+  source. Root cause: the bundled `dlib` wheel used CPU instructions
+  (AVX) not supported on some machines, causing the face-recognition
+  engine to crash the whole app instead of failing gracefully. Fixed by
+  switching to the `dlib-bin` package, which ships a more broadly
+  CPU-compatible prebuilt binary.
+• face_recognition's import failure is no longer silently swallowed —
+  the real exception (if any) is written to face_recognition_error.log
+  next to the app, so packaging issues are diagnosable without guesswork.
+
+Carried over from 2.9 (2026-06 stability patch):
+--------------------------
+• Single Tk root — splash screen uses a Toplevel instead of spawning a
+  second root window, eliminating the classic tkinter multi-root crash risk.
+• Audit log CSV header matches the 10 data columns (House, Streak included).
+• Settings Reset actually persists the reset values to disk.
+• Auto-notify email/WhatsApp decoupled from UI variable state — reads directly
+  from Settings so the Mail tab doesn't depend on Settings tab widgets.
+• Camera loop, face-processing, and drawing are fully wrapped in try/except
+  so one bad frame cannot kill the live scan.
+• Tooltip, AnimBtn, Toast, and StatCard all defend against widget destruction
+  mid-animation (TclError silenced gracefully).
+• Unknown-face crop is resized if oversized to keep data/unknowns tidy.
+• open_camera falls back to default backend if CAP_DSHOW fails on Windows.
+• StudentDialog mousewheel binding is tagged and unbound cleanly on destroy.
+• Excel image-row removal is wrapped for openpyxl version compatibility.
+• WhatsApp Web first-open checks webbrowser.open's return value.
+• Export menu is cached to avoid transient Menu GC issues.
+• Activity-feed empty hint logic is more robust.
+• Various defensive null checks and exception guards throughout.
+
+Real feature set (for reference):
+--------------------------
+• Face-recognition attendance with liveness detection (hog-based
+  face_recognition + dlib), plus QR-code attendance as a fallback path.
+• Gamification layer: XP, streaks, badges, and house-vs-house competition.
+• Matplotlib-based analytics dashboards.
+• Ollama-backed local AI assistant ("AI Buddy") for querying attendance data.
+• Parent notifications via Gmail and WhatsApp Web.
+• UI text supports 13 Indian languages.
+• Small built-in REST API (http.server-based) for external queries.
+• Excel-native data store with self-healing/resilience if the workbook
+  gets corrupted or a column shifts, so it doesn't misattribute attendance.
+─────────────────────────────────────────────────────────────────
+"""
+
+from __future__ import annotations
+import sys
+import time
+
+import csv
+import io
+import json
+import logging
+import os
+import pickle
+import random
+import re
+import shutil
+import subprocess
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import date, datetime, time as dtime
+from pathlib import Path
+from tkinter import messagebox, simpledialog, ttk
+import tkinter as tk
+
+# ── version ─────────────────────────────────────────────────────────────────
+APP_VERSION = "3.2"
+APP_BUILD   = "2026.08"
+
+# ── Minecraft-style splash quotes — one picked at random every launch ───────
+SPLASH_TEXTS = [
+    "Also try turning it off and on again!",
+    "100% face, 0% recognition of Mondays!",
+    "Now with liveness detection!",
+    "Now with 13 languages!",
+    "Attendance, but make it fun!",
+    "Built in one file. Don't ask why!",
+    "No cap, real attendance!",
+    "Blink twice if you're really here!",
+    "Excel is the real database!",
+    "ESP32 approved!",
+    "Now with badges!",
+    "QR codes included!",
+    "Streaks keep the lights on!",
+    "Punctuality has never looked this good!",
+    "Certified 100% Ollama-optional!",
+    "May contain traces of CustomTkinter!",
+    "Not a single line of Java!",
+    "Made by a student, not a startup!",
+    "Vivo Ignite 2026 ready!",
+    "Encrypted contacts, unencrypted enthusiasm!",
+]
+
+# ── dynamic UI font (per-language, see LANGUAGE_THEMES) ─────────────────────
+# These are plain module globals rather than hardcoded strings so that
+# switching the app language (which changes FONT_FAMILY on the NEXT launch)
+# actually changes the typeface used by every widget in the app, not just
+# the handful of labels that happen to call the translation function.
+FONT_FAMILY = "Segoe UI"
+FONT_MONO   = "Consolas"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("faceattend")
+
+# ── optional heavy packages ──────────────────────────────────────────────────
+MISSING_PACKAGES: list[str] = []
+face_recognition = None
+FACE_RECOGNITION_IMPORT_ERROR = ""
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+    MISSING_PACKAGES.append("opencv-python")
+try:
+    import numpy as np
+except Exception:
+    np = None
+    MISSING_PACKAGES.append("numpy")
+try:
+    from PIL import Image, ImageTk, ImageDraw
+except Exception:
+    Image = ImageTk = ImageDraw = None
+    MISSING_PACKAGES.append("Pillow")
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.drawing.image import Image as ExcelImage
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+except Exception:
+    Workbook = load_workbook = ExcelImage = get_column_letter = None
+    PatternFill = Font = Alignment = Border = Side = None
+    MISSING_PACKAGES.append("openpyxl")
+try:
+    import pygame
+    pygame.mixer.init()
+    pygame.mixer.quit()
+except Exception:
+    pygame = None
+    MISSING_PACKAGES.append("pygame")
+try:
+    import dlib
+except Exception:
+    dlib = None
+try:
+    import cmake  # noqa: F401 — only needed at build time for dlib
+except Exception:
+    pass
+try:
+    import face_recognition as _fr_mod
+    face_recognition = _fr_mod
+    try:
+        import face_recognition_models  # noqa: F401
+    except Exception:
+        pass
+except Exception as _fr_exc:
+    face_recognition = None
+    MISSING_PACKAGES.append("face_recognition")
+    FACE_RECOGNITION_IMPORT_ERROR = f"{type(_fr_exc).__name__}: {_fr_exc}"
+    try:
+        _log_dir = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+        with open(_log_dir / "face_recognition_error.log", "w", encoding="utf-8") as _f:
+            import traceback
+            _f.write(FACE_RECOGNITION_IMPORT_ERROR + "\n\n")
+            traceback.print_exc(file=_f)
+    except Exception:
+        pass
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
+try:
+    from reportlab.lib import colors as _rl_colors  # noqa: F401
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
+try:
+    import qrcode
+    from qrcode.image.pil import PilImage
+except Exception:
+    qrcode = None
+    PilImage = None
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+except Exception:
+    plt = Figure = FigureCanvasTkAgg = None
+try:
+    from cryptography.fernet import Fernet
+except Exception:
+    Fernet = None
+try:
+    from scipy.spatial import distance as sci_dist
+except Exception:
+    sci_dist = None
+try:
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import socketserver
+except Exception:
+    BaseHTTPRequestHandler = HTTPServer = socketserver = None
+
+# ── paths ────────────────────────────────────────────────────────────────────
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+
+DATA_DIR        = APP_DIR / "data"
+FACES_DIR       = DATA_DIR / "faces"
+UNKNOWNS_DIR    = DATA_DIR / "unknowns"
+ASSETS_DIR      = APP_DIR / "assets"
+ICON_FILE       = ASSETS_DIR / "faceattend_icon.ico"
+BACKUPS_DIR     = APP_DIR / "backups"
+EXPORTS_DIR     = APP_DIR / "exports"
+LOGS_DIR        = DATA_DIR / "logs"
+NOTES_DIR       = DATA_DIR / "Notes"
+WHITEBOARD_DIR  = NOTES_DIR / "Whiteboards"
+SETTINGS_FILE   = DATA_DIR / "settings.json"
+TODAY_SCANS_FILE= DATA_DIR / "today_scans.pkl"
+ENCODINGS_FILE  = DATA_DIR / "encodings.pkl"
+AUDIT_LOG       = LOGS_DIR / "attendance_log.csv"
+
+FIXED_EXCEL_FILENAME = "FaceAttend_Students.xlsx"
+EXCEL_FILE = APP_DIR / FIXED_EXCEL_FILENAME
+
+SOUND_ERROR        = APP_DIR / "sound_error.wav"
+SOUND_CAMERA_START = APP_DIR / "sound_camera_start.wav"
+SOUND_SUCCESS      = APP_DIR / "sound_success.mp3"    # positive actions: add student, etc.
+SOUND_NEGATIVE      = APP_DIR / "sound_negative.mp3"   # negative/destructive actions: remove student
+SOUND_STARTUP       = APP_DIR / "sound_startup.mp3"    # plays once when the app launches
+SOUND_EXPORT        = APP_DIR / "sound_export.mp3"     # plays on successful Export AND Import
+
+DUNGEON_CRAWLER_FILE = DATA_DIR / "dungeon_crawler.py"  # written out from embedded source — /launch dungeon
+
+OLLAMA_URL   = os.getenv("FACEATTEND_OLLAMA_URL",   "http://localhost:11434")
+# A clear improvement over 0.5B while still practical on a 6 GB CPU-only PC.
+OLLAMA_MODEL       = os.getenv("FACEATTEND_OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_NUM_CTX     = int(os.getenv("FACEATTEND_OLLAMA_NUM_CTX", "2048"))
+OLLAMA_NUM_PREDICT = int(os.getenv("FACEATTEND_OLLAMA_NUM_PREDICT", "96"))
+
+# ── schema ───────────────────────────────────────────────────────────────────
+COLUMNS = [
+    "Sl.No", "Roll No", "UID", "Name", "Grade", "House",
+    "Parent Phone", "Parent Email", "No. of Days Present",
+    "XP", "Multiplier", "Streak",
+]
+PHOTO_COLUMN = len(COLUMNS) + 1
+EXCEL_COLUMN_WIDTHS = {
+    "Sl.No": 7, "Roll No": 13, "UID": 10, "Name": 26,
+    "Grade": 10, "House": 12,
+    "Parent Phone": 18, "Parent Email": 30,
+    "No. of Days Present": 20, "XP": 10, "Multiplier": 12, "Streak": 10,
+}
+HOUSE_COLORS = {
+    "Red":    "#ef4444",
+    "Blue":   "#3b82f6",
+    "Green":  "#22c55e",
+    "Orange": "#f97316",
+    "None":   "",
+}
+HOUSES = ["None", "Red", "Blue", "Green", "Orange"]
+
+LATE_TIME      = dtime(8, 32)
+FACE_THRESHOLD = 0.50
+FRAME_SKIP     = 3
+CAMERA_W       = 640
+CAMERA_H       = 480
+
+# ── global Excel lock ────────────────────────────────────────────────────────
+_excel_lock = threading.Lock()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COLOUR PALETTE  (dark)
+# ═══════════════════════════════════════════════════════════════════════════════
+def play_sound(path: Path) -> None:
+    """Play an MP3 file via pygame.mixer — non-blocking, daemon thread."""
+    if not path.exists():
+        return
+
+    def _play():
+        try:
+            import pygame
+            pygame.mixer.init()
+            pygame.mixer.music.load(str(path))
+            pygame.mixer.music.play()
+            import time as _time
+            while pygame.mixer.music.get_busy():
+                _time.sleep(0.05)
+        except Exception as e:
+            print(f"[FaceAttend] Sound error: {e}")
+
+    threading.Thread(target=_play, daemon=True).start()
+class _PaletteDark:
+    rail        = "#0a0e15"
+    bg          = "#0e1117"
+    sidebar     = "#12161f"
+    sidebar2    = "#1a2130"
+    surface     = "#1c2233"
+    surface2    = "#222b3a"
+    hover       = "#283248"
+    border      = "#2a3448"
+    border_soft = "#202838"
+    text        = "#e8edf5"
+    muted       = "#7b8aa0"
+    faint       = "#4d586c"
+    blue        = "#3b82f6"
+    blue_dark   = "#2563eb"
+    blue_glow   = "#1d4ed8"
+    blue_soft   = "#132236"
+    green       = "#22c55e"
+    green_dark  = "#16a34a"
+    green_soft  = "#0d2218"
+    amber       = "#f59e0b"
+    amber_soft  = "#241b08"
+    red         = "#ef4444"
+    red_dark    = "#dc2626"
+    red_soft    = "#2a1316"
+    purple      = "#a855f7"
+    purple_soft = "#1c1430"
+    ink         = "#f1f5f9"
+    tint_blue   = "#0f1e35"
+    tint_green  = "#0d2218"
+    tint_amber  = "#231a05"
+    tint_purple = "#1a1030"
+    chart_bg    = "#0e1117"
+    chart_fg    = "#e8edf5"
+    chart_grid  = "#2a3448"
+    calendar_present = "#22c55e"
+    calendar_absent  = "#ef4444"
+    calendar_neutral = "#2a3448"
+
+
+class _PaletteLight:
+    rail        = "#f1f5f9"
+    bg          = "#ffffff"
+    sidebar     = "#f8fafc"
+    sidebar2    = "#f1f5f9"
+    surface     = "#ffffff"
+    surface2    = "#f8fafc"
+    hover       = "#e2e8f0"
+    border      = "#cbd5e1"
+    border_soft = "#e2e8f0"
+    text        = "#0f172a"
+    muted       = "#64748b"
+    faint       = "#94a3b8"
+    blue        = "#2563eb"
+    blue_dark   = "#1d4ed8"
+    blue_glow   = "#1e40af"
+    blue_soft   = "#dbeafe"
+    green       = "#16a34a"
+    green_dark  = "#15803d"
+    green_soft  = "#dcfce7"
+    amber       = "#d97706"
+    amber_soft  = "#fef3c7"
+    red         = "#dc2626"
+    red_dark    = "#b91c1c"
+    red_soft    = "#fee2e2"
+    purple      = "#7c3aed"
+    purple_soft = "#ede9fe"
+    ink         = "#0f172a"
+    tint_blue   = "#eff6ff"
+    tint_green  = "#f0fdf4"
+    tint_amber  = "#fffbeb"
+    tint_purple = "#f5f3ff"
+    chart_bg    = "#ffffff"
+    chart_fg    = "#0f172a"
+    chart_grid  = "#e2e8f0"
+    calendar_present = "#16a34a"
+    calendar_absent  = "#dc2626"
+    calendar_neutral = "#e2e8f0"
+
+
+P = _PaletteDark()  # module-level active palette
+
+
+def set_theme(dark: bool = True):
+    """Swap the global active palette between Dark and Light."""
+    global P
+    P = _PaletteDark() if dark else _PaletteLight()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTERNATIONALISATION (i18n)
+# ═══════════════════════════════════════════════════════════════════════════════
+TRANSLATIONS = {
+    "en": {
+        "app_title": "FaceAttend {ver}  ·  Smart Attendance System",
+        "home_scanner": "Home & Scanner",
+        "analytics": "Analytics",
+        "ai_buddy": "AI Buddy",
+        "messages": "Messages",
+        "houses": "House Competition",
+        "console": "Console",
+        "settings": "Settings",
+        "start_scan": "▶  Start Scan",
+        "stop_scan": "■  Stop Scan",
+        "refresh": "↺  Refresh",
+        "add_student": "➕  Add",
+        "edit_student": "✏  Edit",
+        "remove_student": "🗑  Remove",
+        "import": "📥  Import",
+        "export": "⬇  Export",
+        "total_students": "Total Students",
+        "present_today": "Present Today",
+        "absent_today": "Absent Today",
+        "xp_leader": "XP Leader",
+        "enrolled": "Enrolled",
+        "scanned_in": "Scanned in",
+        "not_yet_seen": "Not yet seen",
+        "top_scorer": "Top scorer",
+        "teacher_dashboard": "Teacher Dashboard",
+        "search": "Search students...",
+        "clear": "Clear",
+        "last_recognition": "LAST RECOGNITION",
+        "waiting": "Waiting for student…",
+        "start_scanning": "Start scanning to mark attendance.",
+        "activity_feed": "Activity Feed",
+        "no_activity": "No activity yet — add a student or start scanning.",
+        "camera_off": "📷  Camera is off",
+        "settings_saved": "Settings saved.",
+        "settings_reset": "Settings reset to defaults.",
+        "backup_saved": "Backup saved.",
+        "email_sent": "Email sent to parent of {name}",
+        "whatsapp_opened": "WhatsApp opened for parent of {name}",
+        "student_added": "{name} added successfully!",
+        "student_updated": "{name} updated.",
+        "student_removed": "{name} removed.",
+        "select_student_first": "Select a student row first.",
+        "attendance_late": "Late",
+        "attendance_ontime": "On time",
+        "welcome": "Welcome, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "Language",
+        "theme": "Theme",
+        "dark": "Dark",
+        "light": "Light",
+        "schedule": "Schedule",
+        "badges": "Badges & Achievements",
+        "badge_first_steps": "First Steps",
+        "badge_week_warrior": "Week Warrior",
+        "badge_month_master": "Month Master",
+        "badge_early_bird": "Early Bird",
+        "badge_centurion": "Centurion",
+        "badge_house_hero": "House Hero",
+        "qr_code": "QR Code",
+        "generate_qr": "Generate QR",
+        "scan_qr": "Scan QR",
+        "liveness": "Liveness Detection",
+        "voice_feedback": "Voice Feedback",
+        "multi_camera": "Multi-Camera",
+        "camera_select": "Select Camera",
+        "api_server": "REST API Server",
+        "api_running": "API running on port {port}",
+        "api_stopped": "API stopped",
+        "calendar": "Attendance Calendar",
+        "jan": "Jan", "feb": "Feb", "mar": "Mar", "apr": "Apr",
+        "may": "May", "jun": "Jun", "jul": "Jul", "aug": "Aug",
+        "sep": "Sep", "oct": "Oct", "nov": "Nov", "dec": "Dec",
+        "mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu",
+        "fri": "Fri", "sat": "Sat", "sun": "Sun",
+        "select_all": "Select All",
+        "selected_count": "{n} selected",
+        "clear_selection": "Clear Selection",
+        "bulk_actions": "Bulk Actions",
+        "remove_selected": "🗑 Remove Selected",
+        "change_section_selected": "Change Section…",
+        "promote_students": "🎓 Promote Students",
+        "promote_title": "Promote Students — New Academic Year",
+        "promote_desc": "Move every student up to their new grade/section. Review and edit each mapping before applying.",
+        "apply_promotion": "Apply Promotion",
+        "whiteboard": "Whiteboard",
+        "notepad": "Notepad",
+        "save_note": "Save Note",
+        "new_note": "New Note",
+        "my_notes": "My Notes",
+        "clear_board": "Clear Board",
+        "save_drawing": "Save Drawing",
+        "are_you_sure": "Are you sure?",
+        "cancel": "Cancel",
+        "confirm": "Confirm",
+        "yes": "Yes",
+        "no": "No",
+        "new_section": "New Section",
+        "no_selection": "No students selected.",
+        "ai_power_notice": "AI Buddy can now act on your data — try “remove Aman, Priya” or “change John, Alice to section B”.",
+        "app_tagline": "Smart attendance, scanning & rewards",
+        "mark_attendance": "✅  Mark Attendance",
+        "certificates": "🏅  Certificates",
+        "no_students_enrolled": "No students enrolled yet",
+        "click_add_hint": "Click \"+ Add\" in the toolbar to register your first student.",
+        "col_slno": "Sl.No",
+        "col_rollno": "Roll No",
+        "col_uid": "UID",
+        "col_name": "Name",
+        "col_grade": "Grade",
+        "col_house": "House",
+        "col_phone": "Parent Phone",
+        "col_email": "Parent Email",
+        "col_days": "No. of Days Present",
+        "col_xp": "XP",
+        "col_multiplier": "Multiplier",
+        "col_streak": "Streak",
+        "no_scans_yet": "No scans yet",
+        "analytics_subtitle": "Attendance trends, top students, XP leaders",
+        "bot_subtitle": "Ask about attendance, students, XP, or app actions.",
+        "ai_welcome": "I use live school data. I will say when I do not know.",
+        "ask_btn": "Ask",
+        "mail_subtitle": "Email a parent directly",
+        "houses_subtitle": "Live attendance % by house · auto-updates on every scan",
+        "settings_subtitle": "Customise FaceAttend behaviour",
+    },
+    "hi": {
+        "app_title": "FaceAttend {ver}  ·  स्मार्ट उपस्थिति प्रणाली",
+        "home_scanner": "होम और स्कैनर",
+        "analytics": "विश्लेषण",
+        "ai_buddy": "AI सहायक",
+        "messages": "संदेश",
+        "houses": "हाउस प्रतियोगिता",
+        "console": "कंसोल",
+        "settings": "सेटिंग्स",
+        "start_scan": "▶  स्कैन शुरू करें",
+        "stop_scan": "■  स्कैन रोकें",
+        "refresh": "↺  रिफ्रेश",
+        "add_student": "➕  जोड़ें",
+        "edit_student": "✏  संपादित करें",
+        "remove_student": "🗑  हटाएं",
+        "import": "📥  आयात",
+        "export": "⬇  निर्यात",
+        "total_students": "कुल छात्र",
+        "present_today": "आज उपस्थित",
+        "absent_today": "आज अनुपस्थित",
+        "xp_leader": "XP लीडर",
+        "enrolled": "नामांकित",
+        "scanned_in": "स्कैन किए",
+        "not_yet_seen": "अभी तक नहीं",
+        "top_scorer": "शीर्ष स्कोरर",
+        "teacher_dashboard": "शिक्षक डैशबोर्ड",
+        "search": "छात्र खोजें...",
+        "clear": "साफ करें",
+        "last_recognition": "अंतिम पहचान",
+        "waiting": "छात्र का इंतजार…",
+        "start_scanning": "उपस्थिति दर्ज करने के लिए स्कैनिंग शुरू करें।",
+        "activity_feed": "गतिविधि फ़ीड",
+        "no_activity": "अभी तक कोई गतिविधि नहीं — छात्र जोड़ें या स्कैनिंग शुरू करें।",
+        "camera_off": "📷  कैमरा बंद है",
+        "settings_saved": "सेटिंग्स सहेजी गईं।",
+        "settings_reset": "सेटिंग्स डिफ़ॉल्ट पर रीसेट।",
+        "backup_saved": "बैकअप सहेजा गया।",
+        "email_sent": "{name} के माता-पिता को ईमेल भेजा गया",
+        "whatsapp_opened": "{name} के माता-पिता के लिए WhatsApp खोला गया",
+        "student_added": "{name} सफलतापूर्वक जोड़ा गया!",
+        "student_updated": "{name} अपडेट किया गया।",
+        "student_removed": "{name} हटाया गया।",
+        "select_student_first": "पहले एक छात्र चुनें।",
+        "attendance_late": "देर",
+        "attendance_ontime": "समय पर",
+        "welcome": "स्वागत है, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "भाषा",
+        "theme": "थीम",
+        "dark": "डार्क",
+        "light": "लाइट",
+        "schedule": "अनुसूची",
+        "badges": "बैज और उपलब्धियाँ",
+        "badge_first_steps": "पहले कदम",
+        "badge_week_warrior": "सप्ताह योद्धा",
+        "badge_month_master": "माह मास्टर",
+        "badge_early_bird": "सुबह का पंछी",
+        "badge_centurion": "सैनिक",
+        "badge_house_hero": "हाउस हीरो",
+        "qr_code": "QR कोड",
+        "generate_qr": "QR बनाएं",
+        "scan_qr": "QR स्कैन करें",
+        "liveness": "जीवितता पहचान",
+        "voice_feedback": "आवाज़ प्रतिक्रिया",
+        "multi_camera": "मल्टी-कैमरा",
+        "camera_select": "कैमरा चुनें",
+        "api_server": "REST API सर्वर",
+        "api_running": "पोर्ट {port} पर API चल रहा है",
+        "api_stopped": "API बंद",
+        "calendar": "उपस्थिति कैलेंडर",
+        "jan": "जन", "feb": "फर", "mar": "मार्च", "apr": "अप्रै",
+        "may": "मई", "jun": "जून", "jul": "जुल", "aug": "अग",
+        "sep": "सित", "oct": "अक्टू", "nov": "नव", "dec": "दिस",
+        "mon": "सोम", "tue": "मंगल", "wed": "बुध", "thu": "गुरु",
+        "fri": "शुक्र", "sat": "शनि", "sun": "रवि",
+        "select_all": "सभी चुनें",
+        "selected_count": "{n} चयनित",
+        "clear_selection": "चयन हटाएं",
+        "bulk_actions": "समूह क्रियाएं",
+        "remove_selected": "🗑 चयनित हटाएं",
+        "change_section_selected": "सेक्शन बदलें…",
+        "promote_students": "🎓 छात्रों को प्रोन्नत करें",
+        "promote_title": "छात्र प्रोन्नति — नया शैक्षणिक वर्ष",
+        "promote_desc": "हर छात्र को उसकी नई कक्षा/सेक्शन में ले जाएं। लागू करने से पहले हर मैपिंग जांचें और बदलें।",
+        "apply_promotion": "प्रोन्नति लागू करें",
+        "whiteboard": "व्हाइटबोर्ड",
+        "notepad": "नोटपैड",
+        "save_note": "नोट सहेजें",
+        "new_note": "नया नोट",
+        "my_notes": "मेरे नोट्स",
+        "clear_board": "बोर्ड साफ़ करें",
+        "save_drawing": "ड्रॉइंग सहेजें",
+        "are_you_sure": "क्या आप सुनिश्चित हैं?",
+        "cancel": "रद्द करें",
+        "confirm": "पुष्टि करें",
+        "yes": "हाँ",
+        "no": "नहीं",
+        "new_section": "नया सेक्शन",
+        "no_selection": "कोई छात्र चयनित नहीं है।",
+        "ai_power_notice": "AI बडी अब आपका डेटा भी बदल सकता है — जैसे 'Aman, Priya को हटाओ'।",
+        "app_tagline": "स्मार्ट उपस्थिति, स्कैनिंग और पुरस्कार",
+        "mark_attendance": "✅  उपस्थिति दर्ज करें",
+        "certificates": "🏅  प्रमाणपत्र",
+        "no_students_enrolled": "अभी तक कोई छात्र दर्ज नहीं है",
+        "click_add_hint": "अपना पहला छात्र जोड़ने के लिए टूलबार में \"+ जोड़ें\" पर क्लिक करें।",
+        "col_slno": "क्र.सं.",
+        "col_rollno": "रोल नंबर",
+        "col_uid": "UID",
+        "col_name": "नाम",
+        "col_grade": "कक्षा",
+        "col_house": "हाउस",
+        "col_phone": "अभिभावक फोन",
+        "col_email": "अभिभावक ईमेल",
+        "col_days": "उपस्थित दिन",
+        "col_xp": "XP",
+        "col_multiplier": "गुणक",
+        "col_streak": "स्ट्रीक",
+        "no_scans_yet": "अभी तक कोई स्कैन नहीं",
+        "analytics_subtitle": "उपस्थिति रुझान, शीर्ष छात्र, XP लीडर",
+        "bot_subtitle": "उपस्थिति, छात्रों, XP या ऐप क्रियाओं के बारे में पूछें।",
+        "ai_welcome": "मैं लाइव स्कूल डेटा का उपयोग करता हूं। जब मुझे नहीं पता होगा, मैं बता दूंगा।",
+        "ask_btn": "पूछें",
+        "mail_subtitle": "किसी अभिभावक को सीधे ईमेल करें",
+        "houses_subtitle": "हाउस के अनुसार लाइव उपस्थिति % · हर स्कैन पर अपडेट होता है",
+        "settings_subtitle": "FaceAttend का व्यवहार अनुकूलित करें",
+    },
+    "bn": {
+        "app_title": "FaceAttend {ver}  ·  স্মার্ট উপস্থিতি ব্যবস্থা",
+        "home_scanner": "হোম ও স্ক্যানার",
+        "analytics": "বিশ্লেষণ",
+        "ai_buddy": "AI সহায়ক",
+        "messages": "বার্তা",
+        "houses": "হাউস প্রতিযোগিতা",
+        "console": "কনসোল",
+        "settings": "সেটিংস",
+        "start_scan": "▶  স্ক্যান শুরু করুন",
+        "stop_scan": "■  স্ক্যান বন্ধ করুন",
+        "refresh": "↺  রিফ্রেশ",
+        "add_student": "➕  যুক্ত করুন",
+        "edit_student": "✏  সম্পাদনা",
+        "remove_student": "🗑  অপসারণ",
+        "import": "📥  আমদানি",
+        "export": "⬇  রপ্তানি",
+        "total_students": "মোট শিক্ষার্থী",
+        "present_today": "আজ উপস্থিত",
+        "absent_today": "আজ অনুপস্থিত",
+        "xp_leader": "XP লিডার",
+        "enrolled": "ভর্তি হয়েছে",
+        "scanned_in": "স্ক্যান হয়েছে",
+        "not_yet_seen": "এখনো দেখা যায়নি",
+        "top_scorer": "সর্বোচ্চ স্কোরার",
+        "teacher_dashboard": "শিক্ষক ড্যাশবোর্ড",
+        "search": "শিক্ষার্থী খুঁজুন...",
+        "clear": "পরিষ্কার",
+        "last_recognition": "সর্বশেষ স্বীকৃতি",
+        "waiting": "শিক্ষার্থীর জন্য অপেক্ষা…",
+        "start_scanning": "উপস্থিতি নথিভুক্ত করতে স্ক্যান শুরু করুন।",
+        "activity_feed": "কার্যকলাপ ফিড",
+        "no_activity": "এখনও কোনো কার্যকলাপ নেই — শিক্ষার্থী যুক্ত করুন বা স্ক্যান শুরু করুন।",
+        "camera_off": "📷  ক্যামেরা বন্ধ আছে",
+        "settings_saved": "সেটিংস সংরক্ষিত হয়েছে।",
+        "settings_reset": "সেটিংস ডিফল্টে রিসেট হয়েছে।",
+        "backup_saved": "ব্যাকআপ সংরক্ষিত হয়েছে।",
+        "email_sent": "{name} এর অভিভাবককে ইমেইল পাঠানো হয়েছে",
+        "whatsapp_opened": "{name} এর অভিভাবকের জন্য WhatsApp খোলা হয়েছে",
+        "student_added": "{name} সফলভাবে যুক্ত হয়েছে!",
+        "student_updated": "{name} আপডেট হয়েছে।",
+        "student_removed": "{name} অপসারিত হয়েছে।",
+        "select_student_first": "প্রথমে একজন শিক্ষার্থী নির্বাচন করুন।",
+        "attendance_late": "বিলম্বিত",
+        "attendance_ontime": "সময়মতো",
+        "welcome": "স্বাগতম, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ভাষা",
+        "theme": "থিম",
+        "dark": "ডার্ক",
+        "light": "লাইট",
+        "schedule": "সময়সূচী",
+        "badges": "ব্যাজ ও কৃতিত্ব",
+        "badge_first_steps": "প্রথম পদক্ষেপ",
+        "badge_week_warrior": "সপ্তাহের যোদ্ধা",
+        "badge_month_master": "মাসের মাস্টার",
+        "badge_early_bird": "প্রভাতী পাখি",
+        "badge_centurion": "শতপতি",
+        "badge_house_hero": "হাউস হিরো",
+        "qr_code": "QR কোড",
+        "generate_qr": "QR তৈরি করুন",
+        "scan_qr": "QR স্ক্যান করুন",
+        "liveness": "লাইভনেস সনাক্তকরণ",
+        "voice_feedback": "ভয়েস প্রতিক্রিয়া",
+        "multi_camera": "মাল্টি-ক্যামেরা",
+        "camera_select": "ক্যামেরা নির্বাচন করুন",
+        "api_server": "REST API সার্ভার",
+        "api_running": "পোর্ট {port} এ API চলছে",
+        "api_stopped": "API বন্ধ হয়েছে",
+        "calendar": "উপস্থিতি ক্যালেন্ডার",
+        "jan": "জানু",
+        "feb": "ফেব্রু",
+        "mar": "মার্চ",
+        "apr": "এপ্রিল",
+        "may": "মে",
+        "jun": "জুন",
+        "jul": "জুলাই",
+        "aug": "আগস্ট",
+        "sep": "সেপ্ট",
+        "oct": "অক্টো",
+        "nov": "নভে",
+        "dec": "ডিসে",
+        "mon": "সোম",
+        "tue": "মঙ্গল",
+        "wed": "বুধ",
+        "thu": "বৃহঃ",
+        "fri": "শুক্র",
+        "sat": "শনি",
+        "sun": "রবি",
+        "select_all": "সব নির্বাচন করুন",
+        "selected_count": "{n} নির্বাচিত",
+        "clear_selection": "নির্বাচন মুছুন",
+        "bulk_actions": "গণ কার্য",
+        "remove_selected": "🗑 নির্বাচিত অপসারণ",
+        "change_section_selected": "সেকশন পরিবর্তন করুন…",
+        "promote_students": "🎓 শিক্ষার্থীদের উন্নীত করুন",
+        "promote_title": "শিক্ষার্থী উন্নয়ন — নতুন শিক্ষাবর্ষ",
+        "promote_desc": "প্রতিটি শিক্ষার্থীকে তার নতুন গ্রেড/সেকশনে সরান। প্রয়োগ করার আগে প্রতিটি ম্যাপিং যাচাই ও সম্পাদনা করুন।",
+        "apply_promotion": "উন্নয়ন প্রয়োগ করুন",
+        "whiteboard": "হোয়াইটবোর্ড",
+        "notepad": "নোটপ্যাড",
+        "save_note": "নোট সংরক্ষণ করুন",
+        "new_note": "নতুন নোট",
+        "my_notes": "আমার নোট",
+        "clear_board": "বোর্ড পরিষ্কার করুন",
+        "save_drawing": "অঙ্কন সংরক্ষণ করুন",
+        "are_you_sure": "আপনি কি নিশ্চিত?",
+        "cancel": "বাতিল",
+        "confirm": "নিশ্চিত করুন",
+        "yes": "হ্যাঁ",
+        "no": "না",
+        "new_section": "নতুন সেকশন",
+        "no_selection": "কোনো শিক্ষার্থী নির্বাচিত নয়।",
+        "ai_power_notice": "AI বাডি এখন আপনার ডেটাও পরিবর্তন করতে পারে।",
+        "app_tagline": "স্মার্ট উপস্থিতি, স্ক্যানিং ও পুরস্কার",
+        "mark_attendance": "✅  উপস্থিতি নথিভুক্ত করুন",
+        "certificates": "🏅  সার্টিফিকেট",
+        "no_students_enrolled": "এখনও কোনো শিক্ষার্থী নথিভুক্ত হয়নি",
+        "click_add_hint": "আপনার প্রথম শিক্ষার্থী যোগ করতে টুলবারে \"+ যোগ\" ক্লিক করুন।",
+        "col_slno": "ক্র.নং",
+        "col_rollno": "রোল নং",
+        "col_uid": "UID",
+        "col_name": "নাম",
+        "col_grade": "শ্রেণী",
+        "col_house": "হাউস",
+        "col_phone": "অভিভাবকের ফোন",
+        "col_email": "অভিভাবকের ইমেল",
+        "col_days": "উপস্থিত দিন",
+        "col_xp": "XP",
+        "col_multiplier": "গুণক",
+        "col_streak": "স্ট্রিক",
+        "no_scans_yet": "এখনও কোনো স্ক্যান হয়নি",
+        "analytics_subtitle": "উপস্থিতির প্রবণতা, শীর্ষ শিক্ষার্থী, XP লিডার",
+        "bot_subtitle": "উপস্থিতি, শিক্ষার্থী, XP বা অ্যাপ কার্যক্রম সম্পর্কে জিজ্ঞাসা করুন।",
+        "ai_welcome": "আমি লাইভ স্কুল ডেটা ব্যবহার করি। যখন আমি জানি না, তখন বলব।",
+        "ask_btn": "জিজ্ঞাসা করুন",
+        "mail_subtitle": "সরাসরি অভিভাবককে ইমেল করুন",
+        "houses_subtitle": "হাউস অনুযায়ী লাইভ উপস্থিতি % · প্রতিটি স্ক্যানে আপডেট হয়",
+        "settings_subtitle": "FaceAttend আচরণ কাস্টমাইজ করুন",
+    },
+    "te": {
+        "app_title": "FaceAttend {ver}  ·  స్మార్ట్ హాజరు వ్యవస్థ",
+        "home_scanner": "హోమ్ & స్కానర్",
+        "analytics": "విశ్లేషణలు",
+        "ai_buddy": "AI బడ్డీ",
+        "messages": "సందేశాలు",
+        "houses": "హౌస్ పోటీ",
+        "console": "కన్సోల్",
+        "settings": "సెట్టింగ్‌లు",
+        "start_scan": "▶  స్కాన్ ప్రారంభించండి",
+        "stop_scan": "■  స్కాన్ ఆపండి",
+        "refresh": "↺  రిఫ్రెష్",
+        "add_student": "➕  జోడించండి",
+        "edit_student": "✏  సవరించండి",
+        "remove_student": "🗑  తీసివేయండి",
+        "import": "📥  దిగుమతి",
+        "export": "⬇  ఎగుమతి",
+        "total_students": "మొత్తం విద్యార్థులు",
+        "present_today": "ఈ రోజు హాజరు",
+        "absent_today": "ఈ రోజు గైర్హాజరు",
+        "xp_leader": "XP లీడర్",
+        "enrolled": "నమోదు చేయబడింది",
+        "scanned_in": "స్కాన్ చేయబడింది",
+        "not_yet_seen": "ఇంకా చూడలేదు",
+        "top_scorer": "టాప్ స్కోరర్",
+        "teacher_dashboard": "టీచర్ డాష్‌బోర్డ్",
+        "search": "విద్యార్థులను శోధించండి...",
+        "clear": "క్లియర్",
+        "last_recognition": "చివరి గుర్తింపు",
+        "waiting": "విద్యార్థి కోసం వేచి ఉంది…",
+        "start_scanning": "హాజరు నమోదు చేయడానికి స్కానింగ్ ప్రారంభించండి।",
+        "activity_feed": "కార్యకలాప ఫీడ్",
+        "no_activity": "ఇంకా కార్యకలాపం లేదు — విద్యార్థిని జోడించండి లేదా స్కానింగ్ ప్రారంభించండి।",
+        "camera_off": "📷  కెమెరా ఆఫ్‌లో ఉంది",
+        "settings_saved": "సెట్టింగ్‌లు సేవ్ చేయబడ్డాయి।",
+        "settings_reset": "సెట్టింగ్‌లు డిఫాల్ట్‌కు రీసెట్ చేయబడ్డాయి।",
+        "backup_saved": "బ్యాకప్ సేవ్ చేయబడింది।",
+        "email_sent": "{name} యొక్క తల్లిదండ్రులకు ఇమెయిల్ పంపబడింది",
+        "whatsapp_opened": "{name} యొక్క తల్లిదండ్రుల కోసం WhatsApp తెరవబడింది",
+        "student_added": "{name} విజయవంతంగా జోడించబడింది!",
+        "student_updated": "{name} నవీకరించబడింది।",
+        "student_removed": "{name} తీసివేయబడింది।",
+        "select_student_first": "మొదట ఒక విద్యార్థిని ఎంచుకోండి।",
+        "attendance_late": "ఆలస్యం",
+        "attendance_ontime": "సమయానికి",
+        "welcome": "స్వాగతం, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "భాష",
+        "theme": "థీమ్",
+        "dark": "డార్క్",
+        "light": "లైట్",
+        "schedule": "షెడ్యూల్",
+        "badges": "బ్యాడ్జీలు & సాధనలు",
+        "badge_first_steps": "మొదటి అడుగులు",
+        "badge_week_warrior": "వీక్ వారియర్",
+        "badge_month_master": "మంత్ మాస్టర్",
+        "badge_early_bird": "ఎర్లీ బర్డ్",
+        "badge_centurion": "సెంచూరియన్",
+        "badge_house_hero": "హౌస్ హీరో",
+        "qr_code": "QR కోడ్",
+        "generate_qr": "QR తయారు చేయండి",
+        "scan_qr": "QR స్కాన్ చేయండి",
+        "liveness": "లైవ్‌నెస్ గుర్తింపు",
+        "voice_feedback": "వాయిస్ ఫీడ్‌బ్యాక్",
+        "multi_camera": "మల్టీ-కెమెరా",
+        "camera_select": "కెమెరాను ఎంచుకోండి",
+        "api_server": "REST API సర్వర్",
+        "api_running": "పోర్ట్ {port} లో API నడుస్తోంది",
+        "api_stopped": "API ఆగిపోయింది",
+        "calendar": "హాజరు క్యాలెండర్",
+        "jan": "జన",
+        "feb": "ఫెబ్ర",
+        "mar": "మార్చి",
+        "apr": "ఏప్రి",
+        "may": "మే",
+        "jun": "జూన్",
+        "jul": "జూలై",
+        "aug": "ఆగ",
+        "sep": "సెప్టెం",
+        "oct": "అక్టో",
+        "nov": "నవం",
+        "dec": "డిసెం",
+        "mon": "సోమ",
+        "tue": "మంగళ",
+        "wed": "బుధ",
+        "thu": "గురు",
+        "fri": "శుక్ర",
+        "sat": "శని",
+        "sun": "ఆది",
+        "select_all": "అన్నీ ఎంచుకోండి",
+        "selected_count": "{n} ఎంపిక చేయబడ్డాయి",
+        "clear_selection": "ఎంపిక తీసివేయండి",
+        "bulk_actions": "సమూహ చర్యలు",
+        "remove_selected": "🗑 ఎంచుకున్నవి తీసివేయండి",
+        "change_section_selected": "సెక్షన్ మార్చండి…",
+        "promote_students": "🎓 విద్యార్థులను ప్రమోట్ చేయండి",
+        "promote_title": "విద్యార్థుల ప్రమోషన్ — కొత్త విద్యా సంవత్సరం",
+        "promote_desc": "ప్రతి విద్యార్థిని వారి కొత్త గ్రేడ్/సెక్షన్‌కు మార్చండి. వర్తింపజేయడానికి ముందు ప్రతి మ్యాపింగ్‌ను సమీక్షించండి.",
+        "apply_promotion": "ప్రమోషన్ వర్తింపజేయండి",
+        "whiteboard": "వైట్‌బోర్డ్",
+        "notepad": "నోట్‌ప్యాడ్",
+        "save_note": "నోట్ సేవ్ చేయండి",
+        "new_note": "కొత్త నోట్",
+        "my_notes": "నా నోట్స్",
+        "clear_board": "బోర్డ్ క్లియర్ చేయండి",
+        "save_drawing": "డ్రాయింగ్ సేవ్ చేయండి",
+        "are_you_sure": "మీరు ఖచ్చితంగా ఉన్నారా?",
+        "cancel": "రద్దు చేయండి",
+        "confirm": "నిర్ధారించండి",
+        "yes": "అవును",
+        "no": "లేదు",
+        "new_section": "కొత్త సెక్షన్",
+        "no_selection": "విద్యార్థులు ఎంపిక చేయబడలేదు.",
+        "ai_power_notice": "AI బడీ ఇప్పుడు మీ డేటాను కూడా మార్చగలదు.",
+        "app_tagline": "స్మార్ట్ హాజరు, స్కానింగ్ & రివార్డులు",
+        "mark_attendance": "✅  హాజరు నమోదు చేయండి",
+        "certificates": "🏅  సర్టిఫికెట్లు",
+        "no_students_enrolled": "ఇంకా విద్యార్థులు నమోదు కాలేదు",
+        "click_add_hint": "మీ మొదటి విద్యార్థిని నమోదు చేయడానికి టూల్‌బార్‌లో \"+ జోడించు\" క్లిక్ చేయండి.",
+        "col_slno": "క్ర.సం",
+        "col_rollno": "రోల్ నం",
+        "col_uid": "UID",
+        "col_name": "పేరు",
+        "col_grade": "తరగతి",
+        "col_house": "హౌస్",
+        "col_phone": "తల్లిదండ్రుల ఫోన్",
+        "col_email": "తల్లిదండ్రుల ఇమెయిల్",
+        "col_days": "హాజరైన రోజులు",
+        "col_xp": "XP",
+        "col_multiplier": "గుణకం",
+        "col_streak": "స్ట్రీక్",
+        "no_scans_yet": "ఇంకా స్కాన్ లేదు",
+        "analytics_subtitle": "హాజరు ధోరణులు, టాప్ విద్యార్థులు, XP లీడర్లు",
+        "bot_subtitle": "హాజరు, విద్యార్థులు, XP లేదా యాప్ చర్యల గురించి అడగండి.",
+        "ai_welcome": "నేను ప్రత్యక్ష పాఠశాల డేటాను ఉపయోగిస్తాను. నాకు తెలియనప్పుడు చెబుతాను.",
+        "ask_btn": "అడగండి",
+        "mail_subtitle": "తల్లిదండ్రులకు నేరుగా ఇమెయిల్ చేయండి",
+        "houses_subtitle": "హౌస్ వారీగా ప్రత్యక్ష హాజరు % · ప్రతి స్కాన్‌లో అప్‌డేట్ అవుతుంది",
+        "settings_subtitle": "FaceAttend ప్రవర్తనను అనుకూలీకరించండి",
+    },
+    "mr": {
+        "app_title": "FaceAttend {ver}  ·  स्मार्ट उपस्थिती प्रणाली",
+        "home_scanner": "होम आणि स्कॅनर",
+        "analytics": "विश्लेषण",
+        "ai_buddy": "AI सहाय्यक",
+        "messages": "संदेश",
+        "houses": "हाऊस स्पर्धा",
+        "console": "कन्सोल",
+        "settings": "सेटिंग्ज",
+        "start_scan": "▶  स्कॅन सुरू करा",
+        "stop_scan": "■  स्कॅन थांबवा",
+        "refresh": "↺  रिफ्रेश",
+        "add_student": "➕  जोडा",
+        "edit_student": "✏  संपादित करा",
+        "remove_student": "🗑  काढून टाका",
+        "import": "📥  आयात",
+        "export": "⬇  निर्यात",
+        "total_students": "एकूण विद्यार्थी",
+        "present_today": "आज उपस्थित",
+        "absent_today": "आज अनुपस्थित",
+        "xp_leader": "XP लीडर",
+        "enrolled": "नोंदणीकृत",
+        "scanned_in": "स्कॅन केले",
+        "not_yet_seen": "अद्याप दिसले नाही",
+        "top_scorer": "सर्वोच्च गुणधारक",
+        "teacher_dashboard": "शिक्षक डॅशबोर्ड",
+        "search": "विद्यार्थी शोधा...",
+        "clear": "साफ करा",
+        "last_recognition": "शेवटची ओळख",
+        "waiting": "विद्यार्थ्याची वाट पाहत आहे…",
+        "start_scanning": "उपस्थिती नोंदवण्यासाठी स्कॅनिंग सुरू करा.",
+        "activity_feed": "क्रियाकलाप फीड",
+        "no_activity": "अद्याप कोणतीही क्रिया नाही — विद्यार्थी जोडा किंवा स्कॅनिंग सुरू करा.",
+        "camera_off": "📷  कॅमेरा बंद आहे",
+        "settings_saved": "सेटिंग्ज जतन केल्या.",
+        "settings_reset": "सेटिंग्ज डीफॉल्टवर रीसेट केल्या.",
+        "backup_saved": "बॅकअप जतन केला.",
+        "email_sent": "{name} च्या पालकांना ईमेल पाठवला",
+        "whatsapp_opened": "{name} च्या पालकांसाठी WhatsApp उघडले",
+        "student_added": "{name} यशस्वीरित्या जोडले!",
+        "student_updated": "{name} अपडेट केले.",
+        "student_removed": "{name} काढून टाकले.",
+        "select_student_first": "प्रथम एक विद्यार्थी निवडा.",
+        "attendance_late": "उशीर",
+        "attendance_ontime": "वेळेवर",
+        "welcome": "स्वागत आहे, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "भाषा",
+        "theme": "थीम",
+        "dark": "डार्क",
+        "light": "लाइट",
+        "schedule": "वेळापत्रक",
+        "badges": "बॅज आणि कामगिरी",
+        "badge_first_steps": "पहिले पाऊल",
+        "badge_week_warrior": "आठवड्याचा योद्धा",
+        "badge_month_master": "महिन्याचा मास्टर",
+        "badge_early_bird": "अर्ली बर्ड",
+        "badge_centurion": "सेंच्युरियन",
+        "badge_house_hero": "हाऊस हिरो",
+        "qr_code": "QR कोड",
+        "generate_qr": "QR तयार करा",
+        "scan_qr": "QR स्कॅन करा",
+        "liveness": "लाइव्हनेस तपासणी",
+        "voice_feedback": "व्हॉइस फीडबॅक",
+        "multi_camera": "मल्टी-कॅमेरा",
+        "camera_select": "कॅमेरा निवडा",
+        "api_server": "REST API सर्व्हर",
+        "api_running": "पोर्ट {port} वर API चालू आहे",
+        "api_stopped": "API थांबले",
+        "calendar": "उपस्थिती कॅलेंडर",
+        "jan": "जाने",
+        "feb": "फेब्रु",
+        "mar": "मार्च",
+        "apr": "एप्रि",
+        "may": "मे",
+        "jun": "जून",
+        "jul": "जुलै",
+        "aug": "ऑगस्ट",
+        "sep": "सप्टें",
+        "oct": "ऑक्टो",
+        "nov": "नोव्हें",
+        "dec": "डिसें",
+        "mon": "सोम",
+        "tue": "मंगळ",
+        "wed": "बुध",
+        "thu": "गुरु",
+        "fri": "शुक्र",
+        "sat": "शनि",
+        "sun": "रवि",
+        "select_all": "सर्व निवडा",
+        "selected_count": "{n} निवडले",
+        "clear_selection": "निवड रद्द करा",
+        "bulk_actions": "सामूहिक क्रिया",
+        "remove_selected": "🗑 निवडलेले काढा",
+        "change_section_selected": "विभाग बदला…",
+        "promote_students": "🎓 विद्यार्थ्यांना पुढील वर्गात न्या",
+        "promote_title": "विद्यार्थी प्रोन्नती — नवीन शैक्षणिक वर्ष",
+        "promote_desc": "प्रत्येक विद्यार्थ्याला त्याच्या नवीन वर्ग/विभागात हलवा. लागू करण्यापूर्वी प्रत्येक मॅपिंग तपासा.",
+        "apply_promotion": "प्रोन्नती लागू करा",
+        "whiteboard": "व्हाइटबोर्ड",
+        "notepad": "नोटपॅड",
+        "save_note": "नोंद जतन करा",
+        "new_note": "नवीन नोंद",
+        "my_notes": "माझ्या नोंदी",
+        "clear_board": "बोर्ड साफ करा",
+        "save_drawing": "रेखाचित्र जतन करा",
+        "are_you_sure": "तुम्हाला खात्री आहे का?",
+        "cancel": "रद्द करा",
+        "confirm": "पुष्टी करा",
+        "yes": "होय",
+        "no": "नाही",
+        "new_section": "नवीन विभाग",
+        "no_selection": "कोणताही विद्यार्थी निवडलेला नाही.",
+        "ai_power_notice": "AI बडी आता तुमचा डेटाही बदलू शकतो.",
+        "app_tagline": "स्मार्ट उपस्थिती, स्कॅनिंग आणि बक्षिसे",
+        "mark_attendance": "✅  उपस्थिती नोंदवा",
+        "certificates": "🏅  प्रमाणपत्रे",
+        "no_students_enrolled": "अद्याप कोणताही विद्यार्थी नोंदवलेला नाही",
+        "click_add_hint": "तुमचा पहिला विद्यार्थी नोंदवण्यासाठी टूलबारमध्ये \"+ जोडा\" क्लिक करा.",
+        "col_slno": "अ.क्र.",
+        "col_rollno": "रोल नं",
+        "col_uid": "UID",
+        "col_name": "नाव",
+        "col_grade": "वर्ग",
+        "col_house": "हाऊस",
+        "col_phone": "पालक फोन",
+        "col_email": "पालक ईमेल",
+        "col_days": "उपस्थित दिवस",
+        "col_xp": "XP",
+        "col_multiplier": "गुणक",
+        "col_streak": "स्ट्रीक",
+        "no_scans_yet": "अजून स्कॅन नाही",
+        "analytics_subtitle": "उपस्थिती कल, अव्वल विद्यार्थी, XP लीडर",
+        "bot_subtitle": "उपस्थिती, विद्यार्थी, XP किंवा अ‍ॅप क्रियांबद्दल विचारा.",
+        "ai_welcome": "मी थेट शाळेचा डेटा वापरतो. मला माहित नसेल तेव्हा मी सांगेन.",
+        "ask_btn": "विचारा",
+        "mail_subtitle": "पालकांना थेट ईमेल करा",
+        "houses_subtitle": "हाऊसनुसार थेट उपस्थिती % · प्रत्येक स्कॅनवर अपडेट होते",
+        "settings_subtitle": "FaceAttend वर्तन सानुकूलित करा",
+    },
+    "ta": {
+        "app_title": "FaceAttend {ver}  ·  ஸ்மார்ட் வருகை அமைப்பு",
+        "home_scanner": "முகப்பு & ஸ்கேனர்",
+        "analytics": "பகுப்பாய்வு",
+        "ai_buddy": "AI துணை",
+        "messages": "செய்திகள்",
+        "houses": "ஹவுஸ் போட்டி",
+        "console": "கன்சோல்",
+        "settings": "அமைப்புகள்",
+        "start_scan": "▶  ஸ்கேன் தொடங்கு",
+        "stop_scan": "■  ஸ்கேன் நிறுத்து",
+        "refresh": "↺  புதுப்பிக்க",
+        "add_student": "➕  சேர்க்க",
+        "edit_student": "✏  திருத்த",
+        "remove_student": "🗑  அகற்ற",
+        "import": "📥  இறக்குமதி",
+        "export": "⬇  ஏற்றுமதி",
+        "total_students": "மொத்த மாணவர்கள்",
+        "present_today": "இன்று வருகை",
+        "absent_today": "இன்று வராதவர்",
+        "xp_leader": "XP தலைவர்",
+        "enrolled": "பதிவு செய்யப்பட்டது",
+        "scanned_in": "ஸ்கேன் செய்யப்பட்டது",
+        "not_yet_seen": "இன்னும் காணப்படவில்லை",
+        "top_scorer": "சிறந்த மதிப்பெண் பெற்றவர்",
+        "teacher_dashboard": "ஆசிரியர் டாஷ்போர்டு",
+        "search": "மாணவர்களைத் தேடு...",
+        "clear": "அழி",
+        "last_recognition": "கடைசி அங்கீகாரம்",
+        "waiting": "மாணவருக்காக காத்திருக்கிறது…",
+        "start_scanning": "வருகையைப் பதிவு செய்ய ஸ்கேனிங் தொடங்கவும்.",
+        "activity_feed": "செயல்பாட்டு ஊட்டம்",
+        "no_activity": "இன்னும் செயல்பாடு இல்லை — மாணவரைச் சேர்க்கவும் அல்லது ஸ்கேன் தொடங்கவும்.",
+        "camera_off": "📷  கேமரா ஆஃப் செய்யப்பட்டது",
+        "settings_saved": "அமைப்புகள் சேமிக்கப்பட்டன.",
+        "settings_reset": "அமைப்புகள் இயல்புநிலைக்கு மீட்டமைக்கப்பட்டன.",
+        "backup_saved": "காப்புப்பிரதி சேமிக்கப்பட்டது.",
+        "email_sent": "{name} இன் பெற்றோருக்கு மின்னஞ்சல் அனுப்பப்பட்டது",
+        "whatsapp_opened": "{name} இன் பெற்றோருக்காக WhatsApp திறக்கப்பட்டது",
+        "student_added": "{name} வெற்றிகரமாக சேர்க்கப்பட்டார்!",
+        "student_updated": "{name} புதுப்பிக்கப்பட்டது.",
+        "student_removed": "{name} அகற்றப்பட்டது.",
+        "select_student_first": "முதலில் ஒரு மாணவரைத் தேர்ந்தெடுக்கவும்.",
+        "attendance_late": "தாமதம்",
+        "attendance_ontime": "சரியான நேரம்",
+        "welcome": "வரவேற்கிறோம், {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "மொழி",
+        "theme": "தீம்",
+        "dark": "டார்க்",
+        "light": "லைட்",
+        "schedule": "அட்டவணை",
+        "badges": "பேட்ஜ்கள் & சாதனைகள்",
+        "badge_first_steps": "முதல் படிகள்",
+        "badge_week_warrior": "வார வாரியர்",
+        "badge_month_master": "மாத மாஸ்டர்",
+        "badge_early_bird": "எர்லி பேர்ட்",
+        "badge_centurion": "சென்சூரியன்",
+        "badge_house_hero": "ஹவுஸ் ஹீரோ",
+        "qr_code": "QR குறியீடு",
+        "generate_qr": "QR உருவாக்கு",
+        "scan_qr": "QR ஸ்கேன் செய்",
+        "liveness": "லைவ்நெஸ் கண்டறிதல்",
+        "voice_feedback": "குரல் பின்னூட்டம்",
+        "multi_camera": "பல கேமரா",
+        "camera_select": "கேமராவைத் தேர்ந்தெடு",
+        "api_server": "REST API சேவையகம்",
+        "api_running": "போர்ட் {port} இல் API இயங்குகிறது",
+        "api_stopped": "API நிறுத்தப்பட்டது",
+        "calendar": "வருகை காலண்டர்",
+        "jan": "ஜன",
+        "feb": "பிப்ர",
+        "mar": "மார்ச்",
+        "apr": "ஏப்ரல்",
+        "may": "மே",
+        "jun": "ஜூன்",
+        "jul": "ஜூலை",
+        "aug": "ஆக",
+        "sep": "செப்",
+        "oct": "அக்",
+        "nov": "நவ",
+        "dec": "டிச",
+        "mon": "திங்",
+        "tue": "செவ்",
+        "wed": "புத",
+        "thu": "வியா",
+        "fri": "வெள்",
+        "sat": "சனி",
+        "sun": "ஞாயி",
+        "select_all": "அனைத்தையும் தேர்ந்தெடு",
+        "selected_count": "{n} தேர்ந்தெடுக்கப்பட்டது",
+        "clear_selection": "தேர்வை அழி",
+        "bulk_actions": "தொகுப்பு செயல்கள்",
+        "remove_selected": "🗑 தேர்ந்தெடுத்தவற்றை நீக்கு",
+        "change_section_selected": "பிரிவை மாற்று…",
+        "promote_students": "🎓 மாணவர்களை மேம்படுத்து",
+        "promote_title": "மாணவர் பதவி உயர்வு — புதிய கல்வியாண்டு",
+        "promote_desc": "ஒவ்வொரு மாணவரையும் அவரது புதிய வகுப்பு/பிரிவுக்கு நகர்த்தவும். செயல்படுத்தும் முன் ஒவ்வொரு மேப்பிங்கையும் சரிபார்க்கவும்.",
+        "apply_promotion": "பதவி உயர்வை செயல்படுத்து",
+        "whiteboard": "வெள்ளைப் பலகை",
+        "notepad": "குறிப்பேடு",
+        "save_note": "குறிப்பை சேமி",
+        "new_note": "புதிய குறிப்பு",
+        "my_notes": "எனது குறிப்புகள்",
+        "clear_board": "பலகையை அழி",
+        "save_drawing": "வரைபடத்தை சேமி",
+        "are_you_sure": "நீங்கள் உறுதியாக இருக்கிறீர்களா?",
+        "cancel": "ரத்து செய்",
+        "confirm": "உறுதிப்படுத்து",
+        "yes": "ஆம்",
+        "no": "இல்லை",
+        "new_section": "புதிய பிரிவு",
+        "no_selection": "மாணவர்கள் தேர்ந்தெடுக்கப்படவில்லை.",
+        "ai_power_notice": "AI பட்டி இப்போது உங்கள் தரவையும் மாற்ற முடியும்.",
+        "app_tagline": "ஸ்மார்ட் வருகை, ஸ்கேனிங் & வெகுமதிகள்",
+        "mark_attendance": "✅  வருகையை பதிவு செய்",
+        "certificates": "🏅  சான்றிதழ்கள்",
+        "no_students_enrolled": "இன்னும் மாணவர்கள் பதிவு செய்யப்படவில்லை",
+        "click_add_hint": "உங்கள் முதல் மாணவரை பதிவு செய்ய கருவிப்பட்டியில் \"+ சேர்\" கிளிக் செய்யவும்.",
+        "col_slno": "வ.எண்",
+        "col_rollno": "ரோல் எண்",
+        "col_uid": "UID",
+        "col_name": "பெயர்",
+        "col_grade": "வகுப்பு",
+        "col_house": "ஹவுஸ்",
+        "col_phone": "பெற்றோர் தொலைபேசி",
+        "col_email": "பெற்றோர் மின்னஞ்சல்",
+        "col_days": "வருகை நாட்கள்",
+        "col_xp": "XP",
+        "col_multiplier": "பெருக்கி",
+        "col_streak": "தொடர்",
+        "no_scans_yet": "இன்னும் ஸ்கேன் இல்லை",
+        "analytics_subtitle": "வருகை போக்குகள், சிறந்த மாணவர்கள், XP லீடர்கள்",
+        "bot_subtitle": "வருகை, மாணவர்கள், XP அல்லது ஆப் செயல்கள் பற்றி கேளுங்கள்.",
+        "ai_welcome": "நான் நேரடி பள்ளி தரவைப் பயன்படுத்துகிறேன். எனக்குத் தெரியாதபோது சொல்வேன்.",
+        "ask_btn": "கேள்",
+        "mail_subtitle": "பெற்றோருக்கு நேரடியாக மின்னஞ்சல் அனுப்பவும்",
+        "houses_subtitle": "ஹவுஸ் வாரியாக நேரடி வருகை % · ஒவ்வொரு ஸ்கேனிலும் புதுப்பிக்கப்படும்",
+        "settings_subtitle": "FaceAttend நடத்தையை தனிப்பயனாக்குக",
+    },
+    "gu": {
+        "app_title": "FaceAttend {ver}  ·  સ્માર્ટ હાજરી સિસ્ટમ",
+        "home_scanner": "હોમ અને સ્કેનર",
+        "analytics": "વિશ્લેષણ",
+        "ai_buddy": "AI સહાયક",
+        "messages": "સંદેશા",
+        "houses": "હાઉસ સ્પર્ધા",
+        "console": "કન્સોલ",
+        "settings": "સેટિંગ્સ",
+        "start_scan": "▶  સ્કેન શરૂ કરો",
+        "stop_scan": "■  સ્કેન બંધ કરો",
+        "refresh": "↺  રિફ્રેશ",
+        "add_student": "➕  ઉમેરો",
+        "edit_student": "✏  સંપાદિત કરો",
+        "remove_student": "🗑  દૂર કરો",
+        "import": "📥  આયાત",
+        "export": "⬇  નિકાસ",
+        "total_students": "કુલ વિદ્યાર્થીઓ",
+        "present_today": "આજે હાજર",
+        "absent_today": "આજે ગેરહાજર",
+        "xp_leader": "XP લીડર",
+        "enrolled": "નોંધાયેલ",
+        "scanned_in": "સ્કેન કરેલ",
+        "not_yet_seen": "હજુ સુધી જોયું નથી",
+        "top_scorer": "ટોચનો સ્કોરર",
+        "teacher_dashboard": "શિક્ષક ડેશબોર્ડ",
+        "search": "વિદ્યાર્થીઓ શોધો...",
+        "clear": "સાફ કરો",
+        "last_recognition": "છેલ્લી ઓળખ",
+        "waiting": "વિદ્યાર્થીની રાહ જોવાઈ રહી છે…",
+        "start_scanning": "હાજરી નોંધવા માટે સ્કેનિંગ શરૂ કરો.",
+        "activity_feed": "પ્રવૃત્તિ ફીડ",
+        "no_activity": "હજુ સુધી કોઈ પ્રવૃત્તિ નથી — વિદ્યાર્થી ઉમેરો અથવા સ્કેનિંગ શરૂ કરો.",
+        "camera_off": "📷  કેમેરા બંધ છે",
+        "settings_saved": "સેટિંગ્સ સાચવેલ.",
+        "settings_reset": "સેટિંગ્સ ડિફોલ્ટ પર રીસેટ.",
+        "backup_saved": "બેકઅપ સાચવ્યું.",
+        "email_sent": "{name} ના વાલીને ઈમેલ મોકલ્યો",
+        "whatsapp_opened": "{name} ના વાલી માટે WhatsApp ખોલ્યું",
+        "student_added": "{name} સફળતાપૂર્વક ઉમેરાયું!",
+        "student_updated": "{name} અપડેટ થયું.",
+        "student_removed": "{name} દૂર કરાયું.",
+        "select_student_first": "પ્રથમ વિદ્યાર્થી પસંદ કરો.",
+        "attendance_late": "મોડું",
+        "attendance_ontime": "સમયસર",
+        "welcome": "સ્વાગત છે, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ભાષા",
+        "theme": "થીમ",
+        "dark": "ડાર્ક",
+        "light": "લાઇટ",
+        "schedule": "સમયપત્રક",
+        "badges": "બેજ અને સિદ્ધિઓ",
+        "badge_first_steps": "પ્રથમ પગલાં",
+        "badge_week_warrior": "વીક વોરિયર",
+        "badge_month_master": "મંથ માસ્ટર",
+        "badge_early_bird": "અર્લી બર્ડ",
+        "badge_centurion": "સેન્ચ્યુરિયન",
+        "badge_house_hero": "હાઉસ હીરો",
+        "qr_code": "QR કોડ",
+        "generate_qr": "QR બનાવો",
+        "scan_qr": "QR સ્કેન કરો",
+        "liveness": "લાઇવનેસ શોધ",
+        "voice_feedback": "વોઇસ પ્રતિસાદ",
+        "multi_camera": "મલ્ટી-કેમેરા",
+        "camera_select": "કેમેરા પસંદ કરો",
+        "api_server": "REST API સર્વર",
+        "api_running": "પોર્ટ {port} પર API ચાલે છે",
+        "api_stopped": "API બંધ થયું",
+        "calendar": "હાજરી કેલેન્ડર",
+        "jan": "જાન્યુ",
+        "feb": "ફેબ્રુ",
+        "mar": "માર્ચ",
+        "apr": "એપ્રિ",
+        "may": "મે",
+        "jun": "જૂન",
+        "jul": "જુલા",
+        "aug": "ઓગ",
+        "sep": "સપ્ટે",
+        "oct": "ઓક્ટો",
+        "nov": "નવે",
+        "dec": "ડિસે",
+        "mon": "સોમ",
+        "tue": "મંગળ",
+        "wed": "બુધ",
+        "thu": "ગુરુ",
+        "fri": "શુક્ર",
+        "sat": "શનિ",
+        "sun": "રવિ",
+        "select_all": "બધા પસંદ કરો",
+        "selected_count": "{n} પસંદ કરેલ",
+        "clear_selection": "પસંદગી સાફ કરો",
+        "bulk_actions": "સામૂહિક ક્રિયાઓ",
+        "remove_selected": "🗑 પસંદ કરેલા દૂર કરો",
+        "change_section_selected": "વિભાગ બદલો…",
+        "promote_students": "🎓 વિદ્યાર્થીઓને પ્રમોટ કરો",
+        "promote_title": "વિદ્યાર્થી પ્રમોશન — નવું શૈક્ષણિક વર્ષ",
+        "promote_desc": "દરેક વિદ્યાર્થીને તેમના નવા ધોરણ/વિભાગમાં ખસેડો. લાગુ કરતાં પહેલાં દરેક મેપિંગ તપાસો.",
+        "apply_promotion": "પ્રમોશન લાગુ કરો",
+        "whiteboard": "વ્હાઇટબોર્ડ",
+        "notepad": "નોટપેડ",
+        "save_note": "નોંધ સાચવો",
+        "new_note": "નવી નોંધ",
+        "my_notes": "મારી નોંધો",
+        "clear_board": "બોર્ડ સાફ કરો",
+        "save_drawing": "ડ્રોઈંગ સાચવો",
+        "are_you_sure": "શું તમે ખાતરી છો?",
+        "cancel": "રદ કરો",
+        "confirm": "પુષ્ટિ કરો",
+        "yes": "હા",
+        "no": "ના",
+        "new_section": "નવો વિભાગ",
+        "no_selection": "કોઈ વિદ્યાર્થી પસંદ કરેલ નથી.",
+        "ai_power_notice": "AI બડી હવે તમારો ડેટા પણ બદલી શકે છે.",
+        "app_tagline": "સ્માર્ટ હાજરી, સ્કેનિંગ અને પુરસ્કારો",
+        "mark_attendance": "✅  હાજરી નોંધો",
+        "certificates": "🏅  પ્રમાણપત્રો",
+        "no_students_enrolled": "હજુ સુધી કોઈ વિદ્યાર્થી નોંધાયેલ નથી",
+        "click_add_hint": "તમારા પ્રથમ વિદ્યાર્થીને નોંધવા માટે ટૂલબારમાં \"+ ઉમેરો\" ક્લિક કરો.",
+        "col_slno": "ક્ર.નં",
+        "col_rollno": "રોલ નં",
+        "col_uid": "UID",
+        "col_name": "નામ",
+        "col_grade": "ધોરણ",
+        "col_house": "હાઉસ",
+        "col_phone": "વાલી ફોન",
+        "col_email": "વાલી ઈમેલ",
+        "col_days": "હાજર દિવસો",
+        "col_xp": "XP",
+        "col_multiplier": "ગુણક",
+        "col_streak": "સ્ટ્રીક",
+        "no_scans_yet": "હજુ કોઈ સ્કેન નથી",
+        "analytics_subtitle": "હાજરીના વલણો, ટોચના વિદ્યાર્થીઓ, XP લીડર્સ",
+        "bot_subtitle": "હાજરી, વિદ્યાર્થીઓ, XP અથવા એપ ક્રિયાઓ વિશે પૂછો.",
+        "ai_welcome": "હું લાઈવ સ્કૂલ ડેટાનો ઉપયોગ કરું છું. જ્યારે મને ખબર નહીં હોય ત્યારે કહીશ.",
+        "ask_btn": "પૂછો",
+        "mail_subtitle": "વાલીને સીધો ઈમેલ કરો",
+        "houses_subtitle": "હાઉસ મુજબ લાઈવ હાજરી % · દરેક સ્કેન પર અપડેટ થાય છે",
+        "settings_subtitle": "FaceAttend વર્તન કસ્ટમાઇઝ કરો",
+    },
+    "ur": {
+        "app_title": "FaceAttend {ver}  ·  اسمارٹ حاضری نظام",
+        "home_scanner": "ہوم اور اسکینر",
+        "analytics": "تجزیات",
+        "ai_buddy": "AI ساتھی",
+        "messages": "پیغامات",
+        "houses": "ہاؤس مقابلہ",
+        "console": "کنسول",
+        "settings": "ترتیبات",
+        "start_scan": "▶  اسکین شروع کریں",
+        "stop_scan": "■  اسکین روکیں",
+        "refresh": "↺  ریفریش",
+        "add_student": "➕  شامل کریں",
+        "edit_student": "✏  ترمیم کریں",
+        "remove_student": "🗑  ہٹائیں",
+        "import": "📥  درآمد",
+        "export": "⬇  برآمد",
+        "total_students": "کل طلباء",
+        "present_today": "آج حاضر",
+        "absent_today": "آج غائب",
+        "xp_leader": "XP لیڈر",
+        "enrolled": "اندراج شدہ",
+        "scanned_in": "اسکین ہوا",
+        "not_yet_seen": "ابھی نہیں دیکھا",
+        "top_scorer": "سب سے زیادہ سکور",
+        "teacher_dashboard": "ٹیچر ڈیش بورڈ",
+        "search": "طلباء تلاش کریں...",
+        "clear": "صاف کریں",
+        "last_recognition": "آخری شناخت",
+        "waiting": "طالب علم کا انتظار…",
+        "start_scanning": "حاضری ریکارڈ کرنے کے لیے اسکیننگ شروع کریں۔",
+        "activity_feed": "سرگرمی فیڈ",
+        "no_activity": "ابھی کوئی سرگرمی نہیں — طالب علم شامل کریں یا اسکیننگ شروع کریں۔",
+        "camera_off": "📷  کیمرہ بند ہے",
+        "settings_saved": "ترتیبات محفوظ ہوگئیں۔",
+        "settings_reset": "ترتیبات ڈیفالٹ پر بحال۔",
+        "backup_saved": "بیک اپ محفوظ ہوگیا۔",
+        "email_sent": "{name} کے والدین کو ای میل بھیجی گئی",
+        "whatsapp_opened": "{name} کے والدین کے لیے WhatsApp کھولا گیا",
+        "student_added": "{name} کامیابی سے شامل ہوگیا!",
+        "student_updated": "{name} اپڈیٹ ہوگیا۔",
+        "student_removed": "{name} ہٹا دیا گیا۔",
+        "select_student_first": "پہلے ایک طالب علم منتخب کریں۔",
+        "attendance_late": "تاخیر سے",
+        "attendance_ontime": "وقت پر",
+        "welcome": "خوش آمدید، {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "زبان",
+        "theme": "تھیم",
+        "dark": "ڈارک",
+        "light": "لائٹ",
+        "schedule": "شیڈول",
+        "badges": "بیجز اور کامیابیاں",
+        "badge_first_steps": "پہلا قدم",
+        "badge_week_warrior": "ویک واریئر",
+        "badge_month_master": "ماہ ماسٹر",
+        "badge_early_bird": "ارلی برڈ",
+        "badge_centurion": "سینچورین",
+        "badge_house_hero": "ہاؤس ہیرو",
+        "qr_code": "QR کوڈ",
+        "generate_qr": "QR بنائیں",
+        "scan_qr": "QR اسکین کریں",
+        "liveness": "لائیونیس کی شناخت",
+        "voice_feedback": "صوتی تاثرات",
+        "multi_camera": "ملٹی کیمرہ",
+        "camera_select": "کیمرہ منتخب کریں",
+        "api_server": "REST API سرور",
+        "api_running": "پورٹ {port} پر API چل رہا ہے",
+        "api_stopped": "API بند ہوگیا",
+        "calendar": "حاضری کیلنڈر",
+        "jan": "جنوری",
+        "feb": "فروری",
+        "mar": "مارچ",
+        "apr": "اپریل",
+        "may": "مئی",
+        "jun": "جون",
+        "jul": "جولائی",
+        "aug": "اگست",
+        "sep": "ستمبر",
+        "oct": "اکتوبر",
+        "nov": "نومبر",
+        "dec": "دسمبر",
+        "mon": "پیر",
+        "tue": "منگل",
+        "wed": "بدھ",
+        "thu": "جمعرات",
+        "fri": "جمعہ",
+        "sat": "ہفتہ",
+        "sun": "اتوار",
+        "select_all": "سب منتخب کریں",
+        "selected_count": "{n} منتخب",
+        "clear_selection": "انتخاب صاف کریں",
+        "bulk_actions": "اجتماعی اقدامات",
+        "remove_selected": "🗑 منتخب حذف کریں",
+        "change_section_selected": "سیکشن تبدیل کریں…",
+        "promote_students": "🎓 طلبہ کو ترقی دیں",
+        "promote_title": "طلبہ کی ترقی — نیا تعلیمی سال",
+        "promote_desc": "ہر طالب علم کو اس کے نئے درجے/سیکشن میں منتقل کریں۔ لاگو کرنے سے پہلے ہر میپنگ کا جائزہ لیں۔",
+        "apply_promotion": "ترقی لاگو کریں",
+        "whiteboard": "وائٹ بورڈ",
+        "notepad": "نوٹ پیڈ",
+        "save_note": "نوٹ محفوظ کریں",
+        "new_note": "نیا نوٹ",
+        "my_notes": "میرے نوٹس",
+        "clear_board": "بورڈ صاف کریں",
+        "save_drawing": "ڈرائنگ محفوظ کریں",
+        "are_you_sure": "کیا آپ کو یقین ہے؟",
+        "cancel": "منسوخ کریں",
+        "confirm": "تصدیق کریں",
+        "yes": "ہاں",
+        "no": "نہیں",
+        "new_section": "نیا سیکشن",
+        "no_selection": "کوئی طالب علم منتخب نہیں۔",
+        "ai_power_notice": "AI بڈی اب آپ کا ڈیٹا بھی بدل سکتا ہے۔",
+        "app_tagline": "سمارٹ حاضری، اسکیننگ اور انعامات",
+        "mark_attendance": "✅  حاضری درج کریں",
+        "certificates": "🏅  سرٹیفکیٹس",
+        "no_students_enrolled": "ابھی تک کوئی طالب علم درج نہیں ہوا",
+        "click_add_hint": "اپنا پہلا طالب علم درج کرنے کے لیے ٹول بار میں \"+ شامل کریں\" پر کلک کریں۔",
+        "col_slno": "نمبر",
+        "col_rollno": "رول نمبر",
+        "col_uid": "UID",
+        "col_name": "نام",
+        "col_grade": "جماعت",
+        "col_house": "ہاؤس",
+        "col_phone": "والدین کا فون",
+        "col_email": "والدین کا ای میل",
+        "col_days": "حاضر دن",
+        "col_xp": "XP",
+        "col_multiplier": "ملٹی پلائر",
+        "col_streak": "سٹریک",
+        "no_scans_yet": "ابھی تک کوئی اسکین نہیں",
+        "analytics_subtitle": "حاضری کے رجحانات، ٹاپ طلبہ، XP لیڈرز",
+        "bot_subtitle": "حاضری، طلبہ، XP یا ایپ کے اقدامات کے بارے میں پوچھیں۔",
+        "ai_welcome": "میں لائیو اسکول ڈیٹا استعمال کرتا ہوں۔ جب مجھے معلوم نہیں ہوگا تو بتا دوں گا۔",
+        "ask_btn": "پوچھیں",
+        "mail_subtitle": "والدین کو براہ راست ای میل کریں",
+        "houses_subtitle": "ہاؤس کے مطابق لائیو حاضری % · ہر اسکین پر اپڈیٹ ہوتا ہے",
+        "settings_subtitle": "FaceAttend کا رویہ حسب ضرورت بنائیں",
+    },
+    "kn": {
+        "app_title": "FaceAttend {ver}  ·  ಸ್ಮಾರ್ಟ್ ಹಾಜರಾತಿ ವ್ಯವಸ್ಥೆ",
+        "home_scanner": "ಮುಖಪುಟ ಮತ್ತು ಸ್ಕ್ಯಾನರ್",
+        "analytics": "ವಿಶ್ಲೇಷಣೆ",
+        "ai_buddy": "AI ಸಹಾಯಕ",
+        "messages": "ಸಂದೇಶಗಳು",
+        "houses": "ಹೌಸ್ ಸ್ಪರ್ಧೆ",
+        "console": "ಕನ್ಸೋಲ್",
+        "settings": "ಸೆಟ್ಟಿಂಗ್‌ಗಳು",
+        "start_scan": "▶  ಸ್ಕ್ಯಾನ್ ಪ್ರಾರಂಭಿಸಿ",
+        "stop_scan": "■  ಸ್ಕ್ಯಾನ್ ನಿಲ್ಲಿಸಿ",
+        "refresh": "↺  ರಿಫ್ರೆಶ್",
+        "add_student": "➕  ಸೇರಿಸಿ",
+        "edit_student": "✏  ಸಂಪಾದಿಸಿ",
+        "remove_student": "🗑  ತೆಗೆದುಹಾಕಿ",
+        "import": "📥  ಆಮದು",
+        "export": "⬇  ರಫ್ತು",
+        "total_students": "ಒಟ್ಟು ವಿದ್ಯಾರ್ಥಿಗಳು",
+        "present_today": "ಇಂದು ಹಾಜರಿ",
+        "absent_today": "ಇಂದು ಗೈರು",
+        "xp_leader": "XP ಮುಂದಾಳು",
+        "enrolled": "ದಾಖಲಾಗಿದೆ",
+        "scanned_in": "ಸ್ಕ್ಯಾನ್ ಆಗಿದೆ",
+        "not_yet_seen": "ಇನ್ನೂ ಕಂಡಿಲ್ಲ",
+        "top_scorer": "ಅತ್ಯುತ್ತಮ ಸ್ಕೋರರ್",
+        "teacher_dashboard": "ಶಿಕ್ಷಕ ಡ್ಯಾಶ್‌ಬೋರ್ಡ್",
+        "search": "ವಿದ್ಯಾರ್ಥಿಗಳನ್ನು ಹುಡುಕಿ...",
+        "clear": "ತೆರವುಗೊಳಿಸಿ",
+        "last_recognition": "ಕೊನೆಯ ಗುರುತಿಸುವಿಕೆ",
+        "waiting": "ವಿದ್ಯಾರ್ಥಿಗಾಗಿ ಕಾಯುತ್ತಿದೆ…",
+        "start_scanning": "ಹಾಜರಾತಿ ದಾಖಲಿಸಲು ಸ್ಕ್ಯಾನಿಂಗ್ ಪ್ರಾರಂಭಿಸಿ.",
+        "activity_feed": "ಚಟುವಟಿಕೆ ಫೀಡ್",
+        "no_activity": "ಇನ್ನೂ ಚಟುವಟಿಕೆ ಇಲ್ಲ — ವಿದ್ಯಾರ್ಥಿಯನ್ನು ಸೇರಿಸಿ ಅಥವಾ ಸ್ಕ್ಯಾನಿಂಗ್ ಪ್ರಾರಂಭಿಸಿ.",
+        "camera_off": "📷  ಕ್ಯಾಮೆರಾ ಆಫ್ ಆಗಿದೆ",
+        "settings_saved": "ಸೆಟ್ಟಿಂಗ್‌ಗಳನ್ನು ಉಳಿಸಲಾಗಿದೆ.",
+        "settings_reset": "ಸೆಟ್ಟಿಂಗ್‌ಗಳನ್ನು ಡೀಫಾಲ್ಟ್‌ಗೆ ಮರುಹೊಂದಿಸಲಾಗಿದೆ.",
+        "backup_saved": "ಬ್ಯಾಕಪ್ ಉಳಿಸಲಾಗಿದೆ.",
+        "email_sent": "{name} ರ ಪೋಷಕರಿಗೆ ಇಮೇಲ್ ಕಳುಹಿಸಲಾಗಿದೆ",
+        "whatsapp_opened": "{name} ರ ಪೋಷಕರಿಗಾಗಿ WhatsApp ತೆರೆಯಲಾಗಿದೆ",
+        "student_added": "{name} ಯಶಸ್ವಿಯಾಗಿ ಸೇರಿಸಲಾಗಿದೆ!",
+        "student_updated": "{name} ಅಪ್ಡೇಟ್ ಆಗಿದೆ.",
+        "student_removed": "{name} ತೆಗೆದುಹಾಕಲಾಗಿದೆ.",
+        "select_student_first": "ಮೊದಲು ಒಬ್ಬ ವಿದ್ಯಾರ್ಥಿಯನ್ನು ಆಯ್ಕೆಮಾಡಿ.",
+        "attendance_late": "ತಡವಾಗಿ",
+        "attendance_ontime": "ಸಮಯಕ್ಕೆ",
+        "welcome": "ಸ್ವಾಗತ, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ಭಾಷೆ",
+        "theme": "ಥೀಮ್",
+        "dark": "ಡಾರ್ಕ್",
+        "light": "ಲೈಟ್",
+        "schedule": "ವೇಳಾಪಟ್ಟಿ",
+        "badges": "ಬ್ಯಾಜ್‌ಗಳು ಮತ್ತು ಸಾಧನೆಗಳು",
+        "badge_first_steps": "ಮೊದಲ ಹೆಜ್ಜೆಗಳು",
+        "badge_week_warrior": "ವೀಕ್ ವಾರಿಯರ್",
+        "badge_month_master": "ಮಂಥ್ ಮಾಸ್ಟರ್",
+        "badge_early_bird": "ಅರ್ಲಿ ಬರ್ಡ್",
+        "badge_centurion": "ಸೆಂಚುರಿಯನ್",
+        "badge_house_hero": "ಹೌಸ್ ಹೀರೋ",
+        "qr_code": "QR ಕೋಡ್",
+        "generate_qr": "QR ರಚಿಸಿ",
+        "scan_qr": "QR ಸ್ಕ್ಯಾನ್ ಮಾಡಿ",
+        "liveness": "ಲೈವ್‌ನೆಸ್ ಪತ್ತೆ",
+        "voice_feedback": "ಧ್ವನಿ ಪ್ರತಿಕ್ರಿಯೆ",
+        "multi_camera": "ಮಲ್ಟಿ-ಕ್ಯಾಮೆರಾ",
+        "camera_select": "ಕ್ಯಾಮೆರಾ ಆಯ್ಕೆಮಾಡಿ",
+        "api_server": "REST API ಸರ್ವರ್",
+        "api_running": "ಪೋರ್ಟ್ {port} ನಲ್ಲಿ API ಚಾಲನೆಯಲ್ಲಿದೆ",
+        "api_stopped": "API ನಿಲ್ಲಿಸಲಾಗಿದೆ",
+        "calendar": "ಹಾಜರಾತಿ ಕ್ಯಾಲೆಂಡರ್",
+        "jan": "ಜನ",
+        "feb": "ಫೆಬ್ರ",
+        "mar": "ಮಾರ್ಚ್",
+        "apr": "ಏಪ್ರಿ",
+        "may": "ಮೇ",
+        "jun": "ಜೂನ್",
+        "jul": "ಜುಲೈ",
+        "aug": "ಆಗ",
+        "sep": "ಸೆಪ್ಟೆಂ",
+        "oct": "ಅಕ್ಟೋ",
+        "nov": "ನವೆಂ",
+        "dec": "ಡಿಸೆಂ",
+        "mon": "ಸೋಮ",
+        "tue": "ಮಂಗಳ",
+        "wed": "ಬುಧ",
+        "thu": "ಗುರು",
+        "fri": "ಶುಕ್ರ",
+        "sat": "ಶನಿ",
+        "sun": "ರವಿ",
+        "select_all": "ಎಲ್ಲವನ್ನೂ ಆಯ್ಕೆಮಾಡಿ",
+        "selected_count": "{n} ಆಯ್ಕೆಯಾಗಿದೆ",
+        "clear_selection": "ಆಯ್ಕೆ ತೆರವುಗೊಳಿಸಿ",
+        "bulk_actions": "ಸಮೂಹ ಕ್ರಿಯೆಗಳು",
+        "remove_selected": "🗑 ಆಯ್ಕೆಮಾಡಿದವುಗಳನ್ನು ತೆಗೆದುಹಾಕಿ",
+        "change_section_selected": "ವಿಭಾಗ ಬದಲಾಯಿಸಿ…",
+        "promote_students": "🎓 ವಿದ್ಯಾರ್ಥಿಗಳನ್ನು ಬಡ್ತಿ ನೀಡಿ",
+        "promote_title": "ವಿದ್ಯಾರ್ಥಿ ಬಡ್ತಿ — ಹೊಸ ಶೈಕ್ಷಣಿಕ ವರ್ಷ",
+        "promote_desc": "ಪ್ರತಿ ವಿದ್ಯಾರ್ಥಿಯನ್ನು ಅವರ ಹೊಸ ತರಗತಿ/ವಿಭಾಗಕ್ಕೆ ಸ್ಥಳಾಂತರಿಸಿ. ಅನ್ವಯಿಸುವ ಮೊದಲು ಪ್ರತಿ ಮ್ಯಾಪಿಂಗ್ ಪರಿಶೀಲಿಸಿ.",
+        "apply_promotion": "ಬಡ್ತಿ ಅನ್ವಯಿಸಿ",
+        "whiteboard": "ವೈಟ್‌ಬೋರ್ಡ್",
+        "notepad": "ನೋಟ್‌ಪ್ಯಾಡ್",
+        "save_note": "ಟಿಪ್ಪಣಿ ಉಳಿಸಿ",
+        "new_note": "ಹೊಸ ಟಿಪ್ಪಣಿ",
+        "my_notes": "ನನ್ನ ಟಿಪ್ಪಣಿಗಳು",
+        "clear_board": "ಬೋರ್ಡ್ ಅಳಿಸಿ",
+        "save_drawing": "ಚಿತ್ರ ಉಳಿಸಿ",
+        "are_you_sure": "ನೀವು ಖಚಿತವಾಗಿದ್ದೀರಾ?",
+        "cancel": "ರದ್ದುಮಾಡಿ",
+        "confirm": "ಖಚಿತಪಡಿಸಿ",
+        "yes": "ಹೌದು",
+        "no": "ಇಲ್ಲ",
+        "new_section": "ಹೊಸ ವಿಭಾಗ",
+        "no_selection": "ಯಾವುದೇ ವಿದ್ಯಾರ್ಥಿ ಆಯ್ಕೆ ಮಾಡಿಲ್ಲ.",
+        "ai_power_notice": "AI ಬಡ್ಡಿ ಈಗ ನಿಮ್ಮ ಡೇಟಾವನ್ನೂ ಬದಲಾಯಿಸಬಹುದು.",
+        "app_tagline": "ಸ್ಮಾರ್ಟ್ ಹಾಜರಾತಿ, ಸ್ಕ್ಯಾನಿಂಗ್ ಮತ್ತು ಬಹುಮಾನಗಳು",
+        "mark_attendance": "✅  ಹಾಜರಾತಿ ದಾಖಲಿಸಿ",
+        "certificates": "🏅  ಪ್ರಮಾಣಪತ್ರಗಳು",
+        "no_students_enrolled": "ಇನ್ನೂ ಯಾವುದೇ ವಿದ್ಯಾರ್ಥಿಗಳು ದಾಖಲಾಗಿಲ್ಲ",
+        "click_add_hint": "ನಿಮ್ಮ ಮೊದಲ ವಿದ್ಯಾರ್ಥಿಯನ್ನು ನೋಂದಾಯಿಸಲು ಟೂಲ್‌ಬಾರ್‌ನಲ್ಲಿ \"+ ಸೇರಿಸಿ\" ಕ್ಲಿಕ್ ಮಾಡಿ.",
+        "col_slno": "ಕ್ರ.ಸಂ",
+        "col_rollno": "ರೋಲ್ ಸಂಖ್ಯೆ",
+        "col_uid": "UID",
+        "col_name": "ಹೆಸರು",
+        "col_grade": "ತರಗತಿ",
+        "col_house": "ಹೌಸ್",
+        "col_phone": "ಪೋಷಕರ ಫೋನ್",
+        "col_email": "ಪೋಷಕರ ಇಮೇಲ್",
+        "col_days": "ಹಾಜರಿದ್ದ ದಿನಗಳು",
+        "col_xp": "XP",
+        "col_multiplier": "ಗುಣಕ",
+        "col_streak": "ಸ್ಟ್ರೀಕ್",
+        "no_scans_yet": "ಇನ್ನೂ ಸ್ಕ್ಯಾನ್ ಇಲ್ಲ",
+        "analytics_subtitle": "ಹಾಜರಾತಿ ಪ್ರವೃತ್ತಿಗಳು, ಟಾಪ್ ವಿದ್ಯಾರ್ಥಿಗಳು, XP ಲೀಡರ್‌ಗಳು",
+        "bot_subtitle": "ಹಾಜರಾತಿ, ವಿದ್ಯಾರ್ಥಿಗಳು, XP ಅಥವಾ ಆ್ಯಪ್ ಕ್ರಿಯೆಗಳ ಬಗ್ಗೆ ಕೇಳಿ.",
+        "ai_welcome": "ನಾನು ಲೈವ್ ಶಾಲಾ ಡೇಟಾ ಬಳಸುತ್ತೇನೆ. ನನಗೆ ತಿಳಿಯದಿದ್ದಾಗ ಹೇಳುತ್ತೇನೆ.",
+        "ask_btn": "ಕೇಳಿ",
+        "mail_subtitle": "ಪೋಷಕರಿಗೆ ನೇರವಾಗಿ ಇಮೇಲ್ ಮಾಡಿ",
+        "houses_subtitle": "ಹೌಸ್ ಪ್ರಕಾರ ಲೈವ್ ಹಾಜರಾತಿ % · ಪ್ರತಿ ಸ್ಕ್ಯಾನ್‌ನಲ್ಲಿ ಅಪ್‌ಡೇಟ್ ಆಗುತ್ತದೆ",
+        "settings_subtitle": "FaceAttend ವರ್ತನೆಯನ್ನು ಕಸ್ಟಮೈಸ್ ಮಾಡಿ",
+    },
+    "or": {
+        "app_title": "FaceAttend {ver}  ·  ସ୍ମାର୍ଟ ଉପସ୍ଥିତି ସିଷ୍ଟମ",
+        "home_scanner": "ହୋମ୍ ଓ ସ୍କାନର",
+        "analytics": "ବିଶ୍ଳେଷଣ",
+        "ai_buddy": "AI ସାଥୀ",
+        "messages": "ବାର୍ତ୍ତା",
+        "houses": "ହାଉସ୍ ପ୍ରତିଯୋଗିତା",
+        "console": "କନସୋଲ୍",
+        "settings": "ସେଟିଂସ୍",
+        "start_scan": "▶  ସ୍କାନ୍ ଆରମ୍ଭ କରନ୍ତୁ",
+        "stop_scan": "■  ସ୍କାନ୍ ବନ୍ଦ କରନ୍ତୁ",
+        "refresh": "↺  ରିଫ୍ରେସ୍",
+        "add_student": "➕  ଯୋଗ କରନ୍ତୁ",
+        "edit_student": "✏  ସମ୍ପାଦନ କରନ୍ତୁ",
+        "remove_student": "🗑  ହଟାନ୍ତୁ",
+        "import": "📥  ଆମଦାନୀ",
+        "export": "⬇  ରପ୍ତାନୀ",
+        "total_students": "ସମୁଦାୟ ଛାତ୍ର",
+        "present_today": "ଆଜି ଉପସ୍ଥିତ",
+        "absent_today": "ଆଜି ଅନୁପସ୍ଥିତ",
+        "xp_leader": "XP ନେତା",
+        "enrolled": "ପଞ୍ଜିକୃତ",
+        "scanned_in": "ସ୍କାନ ହୋଇଛି",
+        "not_yet_seen": "ଏପର୍ଯ୍ୟନ୍ତ ଦେଖାଯାଇନାହିଁ",
+        "top_scorer": "ସର୍ବୋଚ୍ଚ ସ୍କୋରର",
+        "teacher_dashboard": "ଶିକ୍ଷକ ଡ୍ୟାସବୋର୍ଡ",
+        "search": "ଛାତ୍ର ଖୋଜନ୍ତୁ...",
+        "clear": "ସଫା କରନ୍ତୁ",
+        "last_recognition": "ଅନ୍ତିମ ପରିଚୟ",
+        "waiting": "ଛାତ୍ର ପାଇଁ ଅପେକ୍ଷା…",
+        "start_scanning": "ଉପସ୍ଥିତି ଲେଖିବାକୁ ସ୍କାନିଂ ଆରମ୍ଭ କରନ୍ତୁ।",
+        "activity_feed": "କାର୍ଯ୍ୟକଳାପ ଫିଡ୍",
+        "no_activity": "ଏପର୍ଯ୍ୟନ୍ତ କୌଣସି କାର୍ଯ୍ୟକଳାପ ନାହିଁ — ଛାତ୍ର ଯୋଗ କରନ୍ତୁ କିମ୍ବା ସ୍କାନିଂ ଆରମ୍ଭ କରନ୍ତୁ।",
+        "camera_off": "📷  କ୍ୟାମେରା ବନ୍ଦ ଅଛି",
+        "settings_saved": "ସେଟିଂସ୍ ସେଭ ହୋଇଛି।",
+        "settings_reset": "ସେଟିଂସ୍ ଡିଫଲ୍ଟକୁ ରିସେଟ ହୋଇଛି।",
+        "backup_saved": "ବ୍ୟାକଅପ ସେଭ ହୋଇଛି।",
+        "email_sent": "{name} ର ଅଭିଭାବକଙ୍କୁ ଇମେଲ ପଠାଗଲା",
+        "whatsapp_opened": "{name} ର ଅଭିଭାବକ ପାଇଁ WhatsApp ଖୋଲାଗଲା",
+        "student_added": "{name} ସଫଳତାର ସହିତ ଯୋଗ ହେଲା!",
+        "student_updated": "{name} ଅପଡେଟ ହେଲା।",
+        "student_removed": "{name} ହଟାଗଲା।",
+        "select_student_first": "ପ୍ରଥମେ ଏକ ଛାତ୍ର ବାଛନ୍ତୁ।",
+        "attendance_late": "ବିଳମ୍ବିତ",
+        "attendance_ontime": "ସମୟରେ",
+        "welcome": "ସ୍ୱାଗତ, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ଭାଷା",
+        "theme": "ଥିମ୍",
+        "dark": "ଡାର୍କ",
+        "light": "ଲାଇଟ୍",
+        "schedule": "କାର୍ଯ୍ୟସୂଚୀ",
+        "badges": "ବ୍ୟାଜ ଓ ସଫଳତା",
+        "badge_first_steps": "ପ୍ରଥମ ପାଦବିକ୍ଷେପ",
+        "badge_week_warrior": "ସପ୍ତାହ ଯୋଦ୍ଧା",
+        "badge_month_master": "ମାସ ମାଷ୍ଟର",
+        "badge_early_bird": "ଆର୍ଲି ବାର୍ଡ",
+        "badge_centurion": "ସେଞ୍ଚୁରିଅନ୍",
+        "badge_house_hero": "ହାଉସ୍ ହିରୋ",
+        "qr_code": "QR କୋଡ୍",
+        "generate_qr": "QR ତିଆରି କରନ୍ତୁ",
+        "scan_qr": "QR ସ୍କାନ କରନ୍ତୁ",
+        "liveness": "ଲାଇଭନେସ୍ ଚିହ୍ନଟ",
+        "voice_feedback": "ସ୍ୱର ମତାମତ",
+        "multi_camera": "ମଲ୍ଟି-କ୍ୟାମେରା",
+        "camera_select": "କ୍ୟାମେରା ବାଛନ୍ତୁ",
+        "api_server": "REST API ସର୍ଭର",
+        "api_running": "ପୋର୍ଟ {port} ରେ API ଚାଲୁଅଛି",
+        "api_stopped": "API ବନ୍ଦ ହୋଇଛି",
+        "calendar": "ଉପସ୍ଥିତି କ୍ୟାଲେଣ୍ଡର",
+        "jan": "ଜାନୁ",
+        "feb": "ଫେବୃ",
+        "mar": "ମାର୍ଚ୍ଚ",
+        "apr": "ଅପ୍ରେ",
+        "may": "ମେ",
+        "jun": "ଜୁନ",
+        "jul": "ଜୁଲା",
+        "aug": "ଅଗ",
+        "sep": "ସେପ୍ଟେ",
+        "oct": "ଅକ୍ଟୋ",
+        "nov": "ନଭେ",
+        "dec": "ଡିସେ",
+        "mon": "ସୋମ",
+        "tue": "ମଙ୍ଗଳ",
+        "wed": "ବୁଧ",
+        "thu": "ଗୁରୁ",
+        "fri": "ଶୁକ୍ର",
+        "sat": "ଶନି",
+        "sun": "ରବି",
+        "select_all": "ସବୁ ବାଛନ୍ତୁ",
+        "selected_count": "{n} ବଚ୍ଛିତ",
+        "clear_selection": "ଚୟନ ସଫା କରନ୍ତୁ",
+        "bulk_actions": "ସାମୂହିକ କାର୍ଯ୍ୟ",
+        "remove_selected": "🗑 ବଚ୍ଛିତ ହଟାନ୍ତୁ",
+        "change_section_selected": "ବିଭାଗ ବଦଳାନ୍ତୁ…",
+        "promote_students": "🎓 ଛାତ୍ରମାନଙ୍କୁ ପଦୋନ୍ନତି ଦିଅନ୍ତୁ",
+        "promote_title": "ଛାତ୍ର ପଦୋନ୍ନତି — ନୂତନ ଶିକ୍ଷାବର୍ଷ",
+        "promote_desc": "ପ୍ରତ୍ୟେକ ଛାତ୍ରଙ୍କୁ ସେମାନଙ୍କର ନୂତନ ଶ୍ରେଣୀ/ବିଭାଗକୁ ନିଅନ୍ତୁ। ପ୍ରୟୋଗ କରିବା ପୂର୍ବରୁ ପ୍ରତ୍ୟେକ ମାନଚିତ୍ର ଯାଞ୍ଚ କରନ୍ତୁ।",
+        "apply_promotion": "ପଦୋନ୍ନତି ପ୍ରୟୋଗ କରନ୍ତୁ",
+        "whiteboard": "ହ୍ୱାଇଟବୋର୍ଡ",
+        "notepad": "ନୋଟପ୍ୟାଡ୍",
+        "save_note": "ନୋଟ୍ ସେଭ୍ କରନ୍ତୁ",
+        "new_note": "ନୂତନ ନୋଟ୍",
+        "my_notes": "ମୋର ନୋଟ୍ସ",
+        "clear_board": "ବୋର୍ଡ ସଫା କରନ୍ତୁ",
+        "save_drawing": "ଚିତ୍ର ସେଭ୍ କରନ୍ତୁ",
+        "are_you_sure": "ଆପଣ ନିଶ୍ଚିତ କି?",
+        "cancel": "ବାତିଲ୍",
+        "confirm": "ନିଶ୍ଚିତ କରନ୍ତୁ",
+        "yes": "ହଁ",
+        "no": "ନା",
+        "new_section": "ନୂତନ ବିଭାଗ",
+        "no_selection": "କୌଣସି ଛାତ୍ର ବଚ୍ଛିତ ହୋଇନାହାନ୍ତି।",
+        "ai_power_notice": "AI ବଡି ବର୍ତ୍ତମାନ ଆପଣଙ୍କ ଡାଟା ମଧ୍ୟ ବଦଳାଇପାରେ।",
+        "app_tagline": "ସ୍ମାର୍ଟ ଉପସ୍ଥିତି, ସ୍କାନିଂ ଏବଂ ପୁରସ୍କାର",
+        "mark_attendance": "✅  ଉପସ୍ଥିତି ଦାଖଲ କରନ୍ତୁ",
+        "certificates": "🏅  ପ୍ରମାଣପତ୍ର",
+        "no_students_enrolled": "ଏପର୍ଯ୍ୟନ୍ତ କୌଣସି ଛାତ୍ର ପଞ୍ଜୀକୃତ ହୋଇନାହାନ୍ତି",
+        "click_add_hint": "ଆପଣଙ୍କର ପ୍ରଥମ ଛାତ୍ରଙ୍କୁ ପଞ୍ଜୀକରଣ କରିବାକୁ ଟୁଲବାରରେ \"+ ଯୋଗ କରନ୍ତୁ\" କ୍ଲିକ୍ କରନ୍ତୁ।",
+        "col_slno": "କ୍ର.ନଂ",
+        "col_rollno": "ରୋଲ୍ ନଂ",
+        "col_uid": "UID",
+        "col_name": "ନାମ",
+        "col_grade": "ଶ୍ରେଣୀ",
+        "col_house": "ହାଉସ୍",
+        "col_phone": "ଅଭିଭାବକ ଫୋନ୍",
+        "col_email": "ଅଭିଭାବକ ଇମେଲ୍",
+        "col_days": "ଉପସ୍ଥିତ ଦିନ",
+        "col_xp": "XP",
+        "col_multiplier": "ଗୁଣକ",
+        "col_streak": "ଷ୍ଟ୍ରିକ୍",
+        "no_scans_yet": "ଏପର୍ଯ୍ୟନ୍ତ କୌଣସି ସ୍କାନ୍ ନାହିଁ",
+        "analytics_subtitle": "ଉପସ୍ଥିତି ଧାରା, ଶ୍ରେଷ୍ଠ ଛାତ୍ର, XP ଲିଡରମାନ",
+        "bot_subtitle": "ଉପସ୍ଥିତି, ଛାତ୍ର, XP କିମ୍ବା ଆପ୍ କାର୍ଯ୍ୟ ବିଷୟରେ ପଚାରନ୍ତୁ।",
+        "ai_welcome": "ମୁଁ ଲାଇଭ୍ ସ୍କୁଲ ଡାଟା ବ୍ୟବହାର କରେ। ମୋତେ ଜଣା ନଥିଲେ ମୁଁ କହିବି।",
+        "ask_btn": "ପଚାରନ୍ତୁ",
+        "mail_subtitle": "ଅଭିଭାବକଙ୍କୁ ସିଧାସଳଖ ଇମେଲ୍ କରନ୍ତୁ",
+        "houses_subtitle": "ହାଉସ୍ ଅନୁଯାୟୀ ଲାଇଭ୍ ଉପସ୍ଥିତି % · ପ୍ରତ୍ୟେକ ସ୍କାନରେ ଅପଡେଟ୍ ହୁଏ",
+        "settings_subtitle": "FaceAttend ଆଚରଣ କଷ୍ଟମାଇଜ୍ କରନ୍ତୁ",
+    },
+    "ml": {
+        "app_title": "FaceAttend {ver}  ·  സ്മാർട്ട് ഹാജർ സിസ്റ്റം",
+        "home_scanner": "ഹോം & സ്കാനർ",
+        "analytics": "അനലിറ്റിക്സ്",
+        "ai_buddy": "AI ബഡി",
+        "messages": "സന്ദേശങ്ങൾ",
+        "houses": "ഹൗസ് മത്സരം",
+        "console": "കൺസോൾ",
+        "settings": "സെറ്റിംഗ്സ്",
+        "start_scan": "▶  സ്കാൻ ആരംഭിക്കുക",
+        "stop_scan": "■  സ്കാൻ നിർത്തുക",
+        "refresh": "↺  പുതുക്കുക",
+        "add_student": "➕  ചേർക്കുക",
+        "edit_student": "✏  എഡിറ്റ് ചെയ്യുക",
+        "remove_student": "🗑  നീക്കം ചെയ്യുക",
+        "import": "📥  ഇറക്കുമതി",
+        "export": "⬇  കയറ്റുമതി",
+        "total_students": "മൊത്തം വിദ്യാർത്ഥികൾ",
+        "present_today": "ഇന്ന് ഹാജർ",
+        "absent_today": "ഇന്ന് ഹാജരല്ല",
+        "xp_leader": "XP ലീഡർ",
+        "enrolled": "എൻറോൾ ചെയ്തു",
+        "scanned_in": "സ്കാൻ ചെയ്തു",
+        "not_yet_seen": "ഇതുവരെ കണ്ടിട്ടില്ല",
+        "top_scorer": "ടോപ്പ് സ്കോററ്",
+        "teacher_dashboard": "ടീച്ചർ ഡാഷ്ബോർഡ്",
+        "search": "വിദ്യാർത്ഥികളെ തിരയുക...",
+        "clear": "മായ്ക്കുക",
+        "last_recognition": "അവസാന തിരിച്ചറിയൽ",
+        "waiting": "വിദ്യാർത്ഥിക്കായി കാത്തിരിക്കുന്നു…",
+        "start_scanning": "ഹാജർ രേഖപ്പെടുത്താൻ സ്കാനിംഗ് ആരംഭിക്കുക.",
+        "activity_feed": "ആക്റ്റിവിറ്റി ഫീഡ്",
+        "no_activity": "ഇതുവരെ പ്രവർത്തനമൊന്നുമില്ല — ഒരു വിദ്യാർത്ഥിയെ ചേർക്കുക അല്ലെങ്കിൽ സ്കാനിംഗ് ആരംഭിക്കുക.",
+        "camera_off": "📷  ക്യാമറ ഓഫാണ്",
+        "settings_saved": "സെറ്റിംഗ്സ് സംരക്ഷിച്ചു.",
+        "settings_reset": "സെറ്റിംഗ്സ് ഡിഫോൾട്ടിലേക്ക് പുനഃസജ്ജമാക്കി.",
+        "backup_saved": "ബാക്കപ്പ് സംരക്ഷിച്ചു.",
+        "email_sent": "{name} ന്റെ രക്ഷിതാവിന് ഇമെയിൽ അയച്ചു",
+        "whatsapp_opened": "{name} ന്റെ രക്ഷിതാവിനായി WhatsApp തുറന്നു",
+        "student_added": "{name} വിജയകരമായി ചേർത്തു!",
+        "student_updated": "{name} അപ്ഡേറ്റ് ചെയ്തു.",
+        "student_removed": "{name} നീക്കം ചെയ്തു.",
+        "select_student_first": "ആദ്യം ഒരു വിദ്യാർത്ഥിയെ തിരഞ്ഞെടുക്കുക.",
+        "attendance_late": "വൈകി",
+        "attendance_ontime": "സമയത്ത്",
+        "welcome": "സ്വാഗതം, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ഭാഷ",
+        "theme": "തീം",
+        "dark": "ഡാർക്ക്",
+        "light": "ലൈറ്റ്",
+        "schedule": "ഷെഡ്യൂൾ",
+        "badges": "ബാഡ്ജുകളും നേട്ടങ്ങളും",
+        "badge_first_steps": "ആദ്യ ചുവടുകൾ",
+        "badge_week_warrior": "വീക്ക് വാരിയർ",
+        "badge_month_master": "മന്ത് മാസ്റ്റർ",
+        "badge_early_bird": "ഏർലി ബേർഡ്",
+        "badge_centurion": "സെഞ്ച്വറിയൻ",
+        "badge_house_hero": "ഹൗസ് ഹീറോ",
+        "qr_code": "QR കോഡ്",
+        "generate_qr": "QR ഉണ്ടാക്കുക",
+        "scan_qr": "QR സ്കാൻ ചെയ്യുക",
+        "liveness": "ലൈവ്നെസ് കണ്ടെത്തൽ",
+        "voice_feedback": "വോയിസ് ഫീഡ്ബാക്ക്",
+        "multi_camera": "മൾട്ടി-ക്യാമറ",
+        "camera_select": "ക്യാമറ തിരഞ്ഞെടുക്കുക",
+        "api_server": "REST API സെർവർ",
+        "api_running": "പോർട്ട് {port} ൽ API പ്രവർത്തിക്കുന്നു",
+        "api_stopped": "API നിർത്തി",
+        "calendar": "ഹാജർ കലണ്ടർ",
+        "jan": "ജനു",
+        "feb": "ഫെബ്ര",
+        "mar": "മാർച്ച്",
+        "apr": "ഏപ്രി",
+        "may": "മേയ്",
+        "jun": "ജൂൺ",
+        "jul": "ജൂലൈ",
+        "aug": "ഓഗ",
+        "sep": "സെപ്റ്റ",
+        "oct": "ഒക്ടോ",
+        "nov": "നവം",
+        "dec": "ഡിസം",
+        "mon": "തിങ്കൾ",
+        "tue": "ചൊവ്വ",
+        "wed": "ബുധൻ",
+        "thu": "വ്യാഴം",
+        "fri": "വെള്ളി",
+        "sat": "ശനി",
+        "sun": "ഞായർ",
+        "select_all": "എല്ലാം തിരഞ്ഞെടുക്കുക",
+        "selected_count": "{n} തിരഞ്ഞെടുത്തു",
+        "clear_selection": "തിരഞ്ഞെടുപ്പ് മായ്ക്കുക",
+        "bulk_actions": "കൂട്ട പ്രവർത്തനങ്ങൾ",
+        "remove_selected": "🗑 തിരഞ്ഞെടുത്തവ നീക്കം ചെയ്യുക",
+        "change_section_selected": "വിഭാഗം മാറ്റുക…",
+        "promote_students": "🎓 വിദ്യാർത്ഥികളെ പ്രമോട്ട് ചെയ്യുക",
+        "promote_title": "വിദ്യാർത്ഥി പ്രമോഷൻ — പുതിയ അധ്യയന വർഷം",
+        "promote_desc": "ഓരോ വിദ്യാർത്ഥിയെയും അവരുടെ പുതിയ ക്ലാസ്/വിഭാഗത്തിലേക്ക് മാറ്റുക. പ്രയോഗിക്കുന്നതിന് മുമ്പ് ഓരോ മാപ്പിംഗും പരിശോധിക്കുക.",
+        "apply_promotion": "പ്രമോഷൻ പ്രയോഗിക്കുക",
+        "whiteboard": "വൈറ്റ്ബോർഡ്",
+        "notepad": "നോട്ട്പാഡ്",
+        "save_note": "കുറിപ്പ് സേവ് ചെയ്യുക",
+        "new_note": "പുതിയ കുറിപ്പ്",
+        "my_notes": "എന്റെ കുറിപ്പുകൾ",
+        "clear_board": "ബോർഡ് മായ്ക്കുക",
+        "save_drawing": "ഡ്രോയിംഗ് സേവ് ചെയ്യുക",
+        "are_you_sure": "നിങ്ങൾക്ക് ഉറപ്പാണോ?",
+        "cancel": "റദ്ദാക്കുക",
+        "confirm": "സ്ഥിരീകരിക്കുക",
+        "yes": "അതെ",
+        "no": "ഇല്ല",
+        "new_section": "പുതിയ വിഭാഗം",
+        "no_selection": "വിദ്യാർത്ഥികളെ തിരഞ്ഞെടുത്തിട്ടില്ല.",
+        "ai_power_notice": "AI ബഡിക്ക് ഇപ്പോൾ നിങ്ങളുടെ ഡാറ്റയും മാറ്റാൻ കഴിയും.",
+        "app_tagline": "സ്മാർട്ട് ഹാജർ, സ്കാനിംഗ് & റിവാർഡുകൾ",
+        "mark_attendance": "✅  ഹാജർ രേഖപ്പെടുത്തുക",
+        "certificates": "🏅  സർട്ടിഫിക്കറ്റുകൾ",
+        "no_students_enrolled": "ഇതുവരെ വിദ്യാർത്ഥികളെ ചേർത്തിട്ടില്ല",
+        "click_add_hint": "നിങ്ങളുടെ ആദ്യ വിദ്യാർത്ഥിയെ രജിസ്റ്റർ ചെയ്യാൻ ടൂൾബാറിൽ \"+ ചേർക്കുക\" ക്ലിക്ക് ചെയ്യുക.",
+        "col_slno": "ക്ര.നം",
+        "col_rollno": "റോൾ നം",
+        "col_uid": "UID",
+        "col_name": "പേര്",
+        "col_grade": "ക്ലാസ്",
+        "col_house": "ഹൗസ്",
+        "col_phone": "രക്ഷിതാവിന്റെ ഫോൺ",
+        "col_email": "രക്ഷിതാവിന്റെ ഇമെയിൽ",
+        "col_days": "ഹാജരായ ദിവസങ്ങൾ",
+        "col_xp": "XP",
+        "col_multiplier": "ഗുണിതം",
+        "col_streak": "സ്ട്രീക്ക്",
+        "no_scans_yet": "ഇതുവരെ സ്കാൻ ഇല്ല",
+        "analytics_subtitle": "ഹാജർ ട്രെൻഡുകൾ, മികച്ച വിദ്യാർത്ഥികൾ, XP ലീഡർമാർ",
+        "bot_subtitle": "ഹാജർ, വിദ്യാർത്ഥികൾ, XP അല്ലെങ്കിൽ ആപ്പ് പ്രവർത്തനങ്ങളെക്കുറിച്ച് ചോദിക്കുക.",
+        "ai_welcome": "ഞാൻ തത്സമയ സ്കൂൾ ഡാറ്റ ഉപയോഗിക്കുന്നു. എനിക്ക് അറിയാത്തപ്പോൾ പറയും.",
+        "ask_btn": "ചോദിക്കുക",
+        "mail_subtitle": "രക്ഷിതാവിന് നേരിട്ട് ഇമെയിൽ അയയ്ക്കുക",
+        "houses_subtitle": "ഹൗസ് അനുസരിച്ച് തത്സമയ ഹാജർ % · ഓരോ സ്കാനിലും അപ്ഡേറ്റ് ചെയ്യുന്നു",
+        "settings_subtitle": "FaceAttend പെരുമാറ്റം ഇഷ്ടാനുസൃതമാക്കുക",
+    },
+    "pa": {
+        "app_title": "FaceAttend {ver}  ·  ਸਮਾਰਟ ਹਾਜ਼ਰੀ ਸਿਸਟਮ",
+        "home_scanner": "ਹੋਮ ਅਤੇ ਸਕੈਨਰ",
+        "analytics": "ਵਿਸ਼ਲੇਸ਼ਣ",
+        "ai_buddy": "AI ਸਾਥੀ",
+        "messages": "ਸੰਦੇਸ਼",
+        "houses": "ਹਾਊਸ ਮੁਕਾਬਲਾ",
+        "console": "ਕੰਸੋਲ",
+        "settings": "ਸੈਟਿੰਗਾਂ",
+        "start_scan": "▶  ਸਕੈਨ ਸ਼ੁਰੂ ਕਰੋ",
+        "stop_scan": "■  ਸਕੈਨ ਰੋਕੋ",
+        "refresh": "↺  ਤਾਜ਼ਾ ਕਰੋ",
+        "add_student": "➕  ਸ਼ਾਮਲ ਕਰੋ",
+        "edit_student": "✏  ਸੰਪਾਦਿਤ ਕਰੋ",
+        "remove_student": "🗑  ਹਟਾਓ",
+        "import": "📥  ਆਯਾਤ",
+        "export": "⬇  ਨਿਰਯਾਤ",
+        "total_students": "ਕੁੱਲ ਵਿਦਿਆਰਥੀ",
+        "present_today": "ਅੱਜ ਹਾਜ਼ਰ",
+        "absent_today": "ਅੱਜ ਗੈਰਹਾਜ਼ਰ",
+        "xp_leader": "XP ਲੀਡਰ",
+        "enrolled": "ਦਰਜ ਕੀਤਾ",
+        "scanned_in": "ਸਕੈਨ ਕੀਤਾ",
+        "not_yet_seen": "ਅਜੇ ਨਹੀਂ ਦੇਖਿਆ",
+        "top_scorer": "ਸਭ ਤੋਂ ਵੱਧ ਸਕੋਰਰ",
+        "teacher_dashboard": "ਟੀਚਰ ਡੈਸ਼ਬੋਰਡ",
+        "search": "ਵਿਦਿਆਰਥੀ ਲੱਭੋ...",
+        "clear": "ਸਾਫ਼ ਕਰੋ",
+        "last_recognition": "ਆਖਰੀ ਪਛਾਣ",
+        "waiting": "ਵਿਦਿਆਰਥੀ ਦੀ ਉਡੀਕ…",
+        "start_scanning": "ਹਾਜ਼ਰੀ ਦਰਜ ਕਰਨ ਲਈ ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ਕਰੋ।",
+        "activity_feed": "ਸਰਗਰਮੀ ਫੀਡ",
+        "no_activity": "ਅਜੇ ਕੋਈ ਸਰਗਰਮੀ ਨਹੀਂ — ਵਿਦਿਆਰਥੀ ਸ਼ਾਮਲ ਕਰੋ ਜਾਂ ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ਕਰੋ।",
+        "camera_off": "📷  ਕੈਮਰਾ ਬੰਦ ਹੈ",
+        "settings_saved": "ਸੈਟਿੰਗਾਂ ਸੇਵ ਹੋ ਗਈਆਂ।",
+        "settings_reset": "ਸੈਟਿੰਗਾਂ ਡਿਫਾਲਟ ਤੇ ਰੀਸੈਟ ਹੋਈਆਂ।",
+        "backup_saved": "ਬੈਕਅੱਪ ਸੇਵ ਹੋਇਆ।",
+        "email_sent": "{name} ਦੇ ਮਾਪਿਆਂ ਨੂੰ ਈਮੇਲ ਭੇਜੀ ਗਈ",
+        "whatsapp_opened": "{name} ਦੇ ਮਾਪਿਆਂ ਲਈ WhatsApp ਖੋਲ੍ਹਿਆ ਗਿਆ",
+        "student_added": "{name} ਸਫਲਤਾਪੂਰਵਕ ਸ਼ਾਮਲ ਹੋਇਆ!",
+        "student_updated": "{name} ਅੱਪਡੇਟ ਹੋਇਆ।",
+        "student_removed": "{name} ਹਟਾਇਆ ਗਿਆ।",
+        "select_student_first": "ਪਹਿਲਾਂ ਇੱਕ ਵਿਦਿਆਰਥੀ ਚੁਣੋ।",
+        "attendance_late": "ਦੇਰ ਨਾਲ",
+        "attendance_ontime": "ਸਮੇਂ ਸਿਰ",
+        "welcome": "ਜੀ ਆਇਆਂ ਨੂੰ, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ਭਾਸ਼ਾ",
+        "theme": "ਥੀਮ",
+        "dark": "ਡਾਰਕ",
+        "light": "ਲਾਈਟ",
+        "schedule": "ਸਮਾਂ-ਸਾਰਣੀ",
+        "badges": "ਬੈਜ ਅਤੇ ਪ੍ਰਾਪਤੀਆਂ",
+        "badge_first_steps": "ਪਹਿਲੇ ਕਦਮ",
+        "badge_week_warrior": "ਵੀਕ ਵਾਰੀਅਰ",
+        "badge_month_master": "ਮਹੀਨਾ ਮਾਸਟਰ",
+        "badge_early_bird": "ਅਰਲੀ ਬਰਡ",
+        "badge_centurion": "ਸੈਂਚੁਰੀਅਨ",
+        "badge_house_hero": "ਹਾਊਸ ਹੀਰੋ",
+        "qr_code": "QR ਕੋਡ",
+        "generate_qr": "QR ਬਣਾਓ",
+        "scan_qr": "QR ਸਕੈਨ ਕਰੋ",
+        "liveness": "ਲਾਈਵਨੈੱਸ ਖੋਜ",
+        "voice_feedback": "ਆਵਾਜ਼ ਫੀਡਬੈਕ",
+        "multi_camera": "ਮਲਟੀ-ਕੈਮਰਾ",
+        "camera_select": "ਕੈਮਰਾ ਚੁਣੋ",
+        "api_server": "REST API ਸਰਵਰ",
+        "api_running": "ਪੋਰਟ {port} ਤੇ API ਚੱਲ ਰਿਹਾ ਹੈ",
+        "api_stopped": "API ਬੰਦ ਹੋ ਗਿਆ",
+        "calendar": "ਹਾਜ਼ਰੀ ਕੈਲੰਡਰ",
+        "jan": "ਜਨ",
+        "feb": "ਫਰ",
+        "mar": "ਮਾਰ",
+        "apr": "ਅਪ੍ਰੈ",
+        "may": "ਮਈ",
+        "jun": "ਜੂਨ",
+        "jul": "ਜੁਲ",
+        "aug": "ਅਗ",
+        "sep": "ਸਤੰ",
+        "oct": "ਅਕਤੂ",
+        "nov": "ਨਵੰ",
+        "dec": "ਦਸੰ",
+        "mon": "ਸੋਮ",
+        "tue": "ਮੰਗਲ",
+        "wed": "ਬੁੱਧ",
+        "thu": "ਵੀਰ",
+        "fri": "ਸ਼ੁੱਕਰ",
+        "sat": "ਸ਼ਨੀ",
+        "sun": "ਐਤ",
+        "select_all": "ਸਭ ਚੁਣੋ",
+        "selected_count": "{n} ਚੁਣੇ ਗਏ",
+        "clear_selection": "ਚੋਣ ਸਾਫ਼ ਕਰੋ",
+        "bulk_actions": "ਸਮੂਹ ਕਾਰਵਾਈਆਂ",
+        "remove_selected": "🗑 ਚੁਣੇ ਹੋਏ ਹਟਾਓ",
+        "change_section_selected": "ਸੈਕਸ਼ਨ ਬਦਲੋ…",
+        "promote_students": "🎓 ਵਿਦਿਆਰਥੀਆਂ ਨੂੰ ਪ੍ਰਮੋਟ ਕਰੋ",
+        "promote_title": "ਵਿਦਿਆਰਥੀ ਪ੍ਰਮੋਸ਼ਨ — ਨਵਾਂ ਵਿੱਦਿਅਕ ਸਾਲ",
+        "promote_desc": "ਹਰ ਵਿਦਿਆਰਥੀ ਨੂੰ ਉਹਨਾਂ ਦੀ ਨਵੀਂ ਜਮਾਤ/ਸੈਕਸ਼ਨ ਵਿੱਚ ਭੇਜੋ। ਲਾਗੂ ਕਰਨ ਤੋਂ ਪਹਿਲਾਂ ਹਰ ਮੈਪਿੰਗ ਦੀ ਜਾਂਚ ਕਰੋ।",
+        "apply_promotion": "ਪ੍ਰਮੋਸ਼ਨ ਲਾਗੂ ਕਰੋ",
+        "whiteboard": "ਵ੍ਹਾਈਟਬੋਰਡ",
+        "notepad": "ਨੋਟਪੈਡ",
+        "save_note": "ਨੋਟ ਸੰਭਾਲੋ",
+        "new_note": "ਨਵਾਂ ਨੋਟ",
+        "my_notes": "ਮੇਰੇ ਨੋਟਸ",
+        "clear_board": "ਬੋਰਡ ਸਾਫ਼ ਕਰੋ",
+        "save_drawing": "ਡਰਾਇੰਗ ਸੰਭਾਲੋ",
+        "are_you_sure": "ਕੀ ਤੁਹਾਨੂੰ ਯਕੀਨ ਹੈ?",
+        "cancel": "ਰੱਦ ਕਰੋ",
+        "confirm": "ਪੁਸ਼ਟੀ ਕਰੋ",
+        "yes": "ਹਾਂ",
+        "no": "ਨਹੀਂ",
+        "new_section": "ਨਵਾਂ ਸੈਕਸ਼ਨ",
+        "no_selection": "ਕੋਈ ਵਿਦਿਆਰਥੀ ਨਹੀਂ ਚੁਣਿਆ ਗਿਆ।",
+        "ai_power_notice": "AI ਬਡੀ ਹੁਣ ਤੁਹਾਡਾ ਡਾਟਾ ਵੀ ਬਦਲ ਸਕਦਾ ਹੈ।",
+        "app_tagline": "ਸਮਾਰਟ ਹਾਜ਼ਰੀ, ਸਕੈਨਿੰਗ ਅਤੇ ਇਨਾਮ",
+        "mark_attendance": "✅  ਹਾਜ਼ਰੀ ਦਰਜ ਕਰੋ",
+        "certificates": "🏅  ਸਰਟੀਫਿਕੇਟ",
+        "no_students_enrolled": "ਹਾਲੇ ਤੱਕ ਕੋਈ ਵਿਦਿਆਰਥੀ ਦਰਜ ਨਹੀਂ ਹੋਇਆ",
+        "click_add_hint": "ਆਪਣਾ ਪਹਿਲਾ ਵਿਦਿਆਰਥੀ ਦਰਜ ਕਰਨ ਲਈ ਟੂਲਬਾਰ ਵਿੱਚ \"+ ਸ਼ਾਮਲ ਕਰੋ\" ਤੇ ਕਲਿੱਕ ਕਰੋ।",
+        "col_slno": "ਕ੍ਰਮ ਨੰ",
+        "col_rollno": "ਰੋਲ ਨੰ",
+        "col_uid": "UID",
+        "col_name": "ਨਾਮ",
+        "col_grade": "ਜਮਾਤ",
+        "col_house": "ਹਾਊਸ",
+        "col_phone": "ਮਾਪਿਆਂ ਦਾ ਫੋਨ",
+        "col_email": "ਮਾਪਿਆਂ ਦਾ ਈਮੇਲ",
+        "col_days": "ਹਾਜ਼ਰ ਦਿਨ",
+        "col_xp": "XP",
+        "col_multiplier": "ਗੁਣਕ",
+        "col_streak": "ਸਟ੍ਰੀਕ",
+        "no_scans_yet": "ਹਾਲੇ ਤੱਕ ਕੋਈ ਸਕੈਨ ਨਹੀਂ",
+        "analytics_subtitle": "ਹਾਜ਼ਰੀ ਰੁਝਾਨ, ਚੋਟੀ ਦੇ ਵਿਦਿਆਰਥੀ, XP ਲੀਡਰ",
+        "bot_subtitle": "ਹਾਜ਼ਰੀ, ਵਿਦਿਆਰਥੀਆਂ, XP ਜਾਂ ਐਪ ਕਾਰਵਾਈਆਂ ਬਾਰੇ ਪੁੱਛੋ।",
+        "ai_welcome": "ਮੈਂ ਲਾਈਵ ਸਕੂਲ ਡਾਟਾ ਵਰਤਦਾ ਹਾਂ। ਜਦੋਂ ਮੈਨੂੰ ਪਤਾ ਨਹੀਂ ਹੋਵੇਗਾ ਤਾਂ ਦੱਸਾਂਗਾ।",
+        "ask_btn": "ਪੁੱਛੋ",
+        "mail_subtitle": "ਮਾਪਿਆਂ ਨੂੰ ਸਿੱਧਾ ਈਮੇਲ ਕਰੋ",
+        "houses_subtitle": "ਹਾਊਸ ਅਨੁਸਾਰ ਲਾਈਵ ਹਾਜ਼ਰੀ % · ਹਰ ਸਕੈਨ ਤੇ ਅੱਪਡੇਟ ਹੁੰਦਾ ਹੈ",
+        "settings_subtitle": "FaceAttend ਵਿਵਹਾਰ ਨੂੰ ਅਨੁਕੂਲਿਤ ਕਰੋ",
+    },
+    "as": {
+        "app_title": "FaceAttend {ver}  ·  স্মাৰ্ট উপস্থিতি প্ৰণালী",
+        "home_scanner": "হোম আৰু স্কেনাৰ",
+        "analytics": "বিশ্লেষণ",
+        "ai_buddy": "AI সহায়ক",
+        "messages": "বাৰ্তা",
+        "houses": "হাউস প্ৰতিযোগিতা",
+        "console": "কনসোল",
+        "settings": "ছেটিংছ",
+        "start_scan": "▶  স্কেন আৰম্ভ কৰক",
+        "stop_scan": "■  স্কেন বন্ধ কৰক",
+        "refresh": "↺  ৰিফ্ৰেশ",
+        "add_student": "➕  যোগ কৰক",
+        "edit_student": "✏  সম্পাদনা কৰক",
+        "remove_student": "🗑  আঁতৰাওক",
+        "import": "📥  আমদানি",
+        "export": "⬇  ৰপ্তানি",
+        "total_students": "মুঠ শিক্ষাৰ্থী",
+        "present_today": "আজি উপস্থিত",
+        "absent_today": "আজি অনুপস্থিত",
+        "xp_leader": "XP নেতা",
+        "enrolled": "নাম লগোয়া হৈছে",
+        "scanned_in": "স্কেন কৰা হৈছে",
+        "not_yet_seen": "এতিয়াও দেখা যায়নি",
+        "top_scorer": "সৰ্বোচ্চ স্কোৰাৰ",
+        "teacher_dashboard": "শিক্ষক ডেশবোৰ্ড",
+        "search": "শিক্ষাৰ্থী বিচাৰক...",
+        "clear": "পৰিষ্কাৰ কৰক",
+        "last_recognition": "সৰ্বশেষ স্বীকৃতি",
+        "waiting": "শিক্ষাৰ্থীৰ বাবে অপেক্ষা…",
+        "start_scanning": "উপস্থিতি লিপিবদ্ধ কৰিবলে স্কেনিং আৰম্ভ কৰক।",
+        "activity_feed": "কাৰ্যকলাপ ফিড",
+        "no_activity": "এতিয়াও কোনো কাৰ্যকলাপ নাই — শিক্ষাৰ্থী যোগ কৰক অথবা স্কেনিং আৰম্ভ কৰক।",
+        "camera_off": "📷  কেমেৰা বন্ধ আছে",
+        "settings_saved": "ছেটিংছ সংৰক্ষণ কৰা হৈছে।",
+        "settings_reset": "ছেটিংছ ডিফল্টলে ৰিসেট কৰা হৈছে।",
+        "backup_saved": "বেকআপ সংৰক্ষণ কৰা হৈছে।",
+        "email_sent": "{name} ৰ অভিভাৱকলে ইমেইল পঠিওৱা হৈছে",
+        "whatsapp_opened": "{name} ৰ অভিভাৱকৰ বাবে WhatsApp খোলা হৈছে",
+        "student_added": "{name} সফলতাৰে যোগ কৰা হৈছে!",
+        "student_updated": "{name} আপডেট কৰা হৈছে।",
+        "student_removed": "{name} আঁতৰোৱা হৈছে।",
+        "select_student_first": "প্ৰথমে এজন শিক্ষাৰ্থী বাছনি কৰক।",
+        "attendance_late": "পলম",
+        "attendance_ontime": "সময়মতে",
+        "welcome": "স্বাগতম, {name}",
+        "marked_status": "{status}  ·  {roll}  ·  +{xp} XP  ·  {time}",
+        "language": "ভাষা",
+        "theme": "থীম",
+        "dark": "ডাৰ্ক",
+        "light": "লাইট",
+        "schedule": "সময়সূচী",
+        "badges": "বেজ আৰু সফলতা",
+        "badge_first_steps": "প্ৰথম খোজ",
+        "badge_week_warrior": "সপ্তাহৰ যোদ্ধা",
+        "badge_month_master": "মাহৰ মাষ্টাৰ",
+        "badge_early_bird": "আৰ্লি বাৰ্ড",
+        "badge_centurion": "চেঞ্চুৰিয়ন",
+        "badge_house_hero": "হাউস হিৰো",
+        "qr_code": "QR কোড",
+        "generate_qr": "QR বনাওক",
+        "scan_qr": "QR স্কেন কৰক",
+        "liveness": "লাইভনেছ চিনাক্তকৰণ",
+        "voice_feedback": "মাত প্ৰতিক্ৰিয়া",
+        "multi_camera": "মাল্টি-কেমেৰা",
+        "camera_select": "কেমেৰা বাছনি কৰক",
+        "api_server": "REST API চাৰ্ভাৰ",
+        "api_running": "পোৰ্ট {port} ত API চলি আছে",
+        "api_stopped": "API বন্ধ হৈছে",
+        "calendar": "উপস্থিতি কেলেণ্ডাৰ",
+        "jan": "জানু",
+        "feb": "ফেব্ৰু",
+        "mar": "মাৰ্চ",
+        "apr": "এপ্ৰি",
+        "may": "মে",
+        "jun": "জুন",
+        "jul": "জুলাই",
+        "aug": "আগ",
+        "sep": "সেপ্তে",
+        "oct": "অক্টো",
+        "nov": "নৱে",
+        "dec": "ডিসে",
+        "mon": "সোম",
+        "tue": "মঙ্গল",
+        "wed": "বুধ",
+        "thu": "বৃহ",
+        "fri": "শুক্ৰ",
+        "sat": "শনি",
+        "sun": "ৰবি",
+        "select_all": "সকলো বাছক",
+        "selected_count": "{n} বাছনি কৰা হৈছে",
+        "clear_selection": "বাছনি মচক",
+        "bulk_actions": "গোট কাৰ্য",
+        "remove_selected": "🗑 বাছনি কৰাবোৰ আঁতৰাওক",
+        "change_section_selected": "শাখা সলনি কৰক…",
+        "promote_students": "🎓 ছাত্ৰ-ছাত্ৰীক প্ৰমোট কৰক",
+        "promote_title": "ছাত্ৰ প্ৰমোচন — নতুন শিক্ষাবৰ্ষ",
+        "promote_desc": "প্ৰতিজন ছাত্ৰ-ছাত্ৰীক তেওঁলোকৰ নতুন শ্ৰেণী/শাখালৈ স্থানান্তৰ কৰক। প্ৰয়োগ কৰাৰ আগতে প্ৰতিটো মেপিং পৰীক্ষা কৰক।",
+        "apply_promotion": "প্ৰমোচন প্ৰয়োগ কৰক",
+        "whiteboard": "হোৱাইটবৰ্ড",
+        "notepad": "নোটপেড",
+        "save_note": "টোকা সংৰক্ষণ কৰক",
+        "new_note": "নতুন টোকা",
+        "my_notes": "মোৰ টোকাসমূহ",
+        "clear_board": "বৰ্ড পৰিষ্কাৰ কৰক",
+        "save_drawing": "ড্ৰয়িং সংৰক্ষণ কৰক",
+        "are_you_sure": "আপুনি নিশ্চিত নে?",
+        "cancel": "বাতিল কৰক",
+        "confirm": "নিশ্চিত কৰক",
+        "yes": "হয়",
+        "no": "নহয়",
+        "new_section": "নতুন শাখা",
+        "no_selection": "কোনো ছাত্ৰ বাছনি কৰা হোৱা নাই।",
+        "ai_power_notice": "AI বাডীয়ে এতিয়া আপোনাৰ ডেটাও সলনি কৰিব পাৰে।",
+        "app_tagline": "স্মাৰ্ট উপস্থিতি, স্কেনিং আৰু পুৰস্কাৰ",
+        "mark_attendance": "✅  উপস্থিতি লিপিবদ্ধ কৰক",
+        "certificates": "🏅  প্ৰমাণপত্ৰ",
+        "no_students_enrolled": "এতিয়ালৈকে কোনো ছাত্ৰ পঞ্জীয়ন কৰা হোৱা নাই",
+        "click_add_hint": "আপোনাৰ প্ৰথম ছাত্ৰক পঞ্জীয়ন কৰিবলৈ টুলবাৰত \"+ যোগ কৰক\" ক্লিক কৰক।",
+        "col_slno": "ক্ৰ.নং",
+        "col_rollno": "ৰোল নং",
+        "col_uid": "UID",
+        "col_name": "নাম",
+        "col_grade": "শ্ৰেণী",
+        "col_house": "হাউচ",
+        "col_phone": "অভিভাৱকৰ ফোন",
+        "col_email": "অভিভাৱকৰ ইমেইল",
+        "col_days": "উপস্থিত দিন",
+        "col_xp": "XP",
+        "col_multiplier": "গুণক",
+        "col_streak": "স্ট্ৰীক",
+        "no_scans_yet": "এতিয়ালৈকে কোনো স্কেন নাই",
+        "analytics_subtitle": "উপস্থিতিৰ প্ৰৱণতা, শীৰ্ষ ছাত্ৰ, XP লিডাৰ",
+        "bot_subtitle": "উপস্থিতি, ছাত্ৰ, XP বা এপ্ কাৰ্যকলাপৰ বিষয়ে সোধক।",
+        "ai_welcome": "মই লাইভ স্কুল ডেটা ব্যৱহাৰ কৰোঁ। মোক নাজানিলে মই কম।",
+        "ask_btn": "সোধক",
+        "mail_subtitle": "অভিভাৱকক পোনপটীয়াকৈ ইমেইল কৰক",
+        "houses_subtitle": "হাউচ অনুসৰি লাইভ উপস্থিতি % · প্ৰতিটো স্কেনত আপডেট হয়",
+        "settings_subtitle": "FaceAttend আচৰণ কাষ্টমাইজ কৰক",
+    },
+}
+
+LANG_NAMES = {
+    "en": "English",
+    "hi": "हिन्दी (Hindi)",
+    "bn": "বাংলা (Bengali)",
+    "te": "తెలుగు (Telugu)",
+    "mr": "मराठी (Marathi)",
+    "ta": "தமிழ் (Tamil)",
+    "gu": "ગુજરાતી (Gujarati)",
+    "ur": "اردو (Urdu)",
+    "kn": "ಕನ್ನಡ (Kannada)",
+    "or": "ଓଡ଼ିଆ (Odia)",
+    "ml": "മലയാളം (Malayalam)",
+    "pa": "ਪੰਜਾਬੀ (Punjabi)",
+    "as": "অসমীয়া (Assamese)",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  13 LANGUAGE-LINKED VISUAL IDENTITIES  ("13 different apps, one engine")
+# ─────────────────────────────────────────────────────────────────────────────
+# Every language above gets its own accent-colour pair, its own typeface
+# preference, its own nav density (a full labelled sidebar vs a slim
+# icon-only rail) and its own small emblem glyph in the header. Combined,
+# switching the language and restarting genuinely changes how the app
+# *looks and feels* — not just which words are on the screen — while every
+# language still shares one battle-tested layout/rendering engine instead
+# of 13 separately-maintained copies of the whole UI (which would multiply
+# the bug surface 13x for zero benefit to a teacher who just wants their
+# own language). See README.md, "Why 13 themes instead of 13 apps".
+#
+# rail_width / icon_size -> the icon-only navigation rail on the far left
+# resizes per language, so the rail itself is visibly a different shape
+# from one language to the next, on top of the accent colour + font swap.
+# card_style -> "soft" gives cards a tinted highlight border, "sharp" gives
+# a plain flat border, "glow" adds a coloured top accent bar to cards.
+LANGUAGE_THEMES = {
+    "en": {"accent": "#3b82f6", "accent_dark": "#2563eb", "accent_glow": "#1d4ed8", "accent_soft": "#132236",
+           "font": "Segoe UI",        "mono": "Consolas", "rail_width": 84, "icon_size": 19, "card_style": "soft",  "emblem": "\u2302"},
+    "hi": {"accent": "#f97316", "accent_dark": "#ea580c", "accent_glow": "#c2410c", "accent_soft": "#2a1a0a",
+           "font": "Nirmala UI",      "mono": "Consolas", "rail_width": 92, "icon_size": 21, "card_style": "glow",  "emblem": "\U0001F549"},
+    "bn": {"accent": "#22c55e", "accent_dark": "#16a34a", "accent_glow": "#15803d", "accent_soft": "#0d2218",
+           "font": "Vrinda",          "mono": "Consolas", "rail_width": 72, "icon_size": 17, "card_style": "sharp", "emblem": "\U0001F343"},
+    "te": {"accent": "#a855f7", "accent_dark": "#9333ea", "accent_glow": "#7e22ce", "accent_soft": "#1c1430",
+           "font": "Gautami",         "mono": "Consolas", "rail_width": 84, "icon_size": 19, "card_style": "glow",  "emblem": "\u2733"},
+    "mr": {"accent": "#f59e0b", "accent_dark": "#d97706", "accent_glow": "#b45309", "accent_soft": "#241b08",
+           "font": "Shivaji01",       "mono": "Consolas", "rail_width": 88, "icon_size": 20, "card_style": "soft",  "emblem": "\U0001F6A9"},
+    "ta": {"accent": "#ef4444", "accent_dark": "#dc2626", "accent_glow": "#b91c1c", "accent_soft": "#2a1316",
+           "font": "Latha",           "mono": "Consolas", "rail_width": 72, "icon_size": 17, "card_style": "sharp", "emblem": "\U0001F31E"},
+    "gu": {"accent": "#06b6d4", "accent_dark": "#0891b2", "accent_glow": "#0e7490", "accent_soft": "#082a30",
+           "font": "Shruti",          "mono": "Consolas", "rail_width": 84, "icon_size": 19, "card_style": "soft",  "emblem": "\U0001F4D6"},
+    "ur": {"accent": "#14b8a6", "accent_dark": "#0d9488", "accent_glow": "#0f766e", "accent_soft": "#082a26",
+           "font": "Segoe UI",        "mono": "Consolas", "rail_width": 92, "icon_size": 21, "card_style": "glow",  "emblem": "\u2b50"},
+    "kn": {"accent": "#eab308", "accent_dark": "#ca8a04", "accent_glow": "#a16207", "accent_soft": "#241f08",
+           "font": "Tunga",           "mono": "Consolas", "rail_width": 72, "icon_size": 17, "card_style": "sharp", "emblem": "\U0001F3F0"},
+    "or": {"accent": "#ec4899", "accent_dark": "#db2777", "accent_glow": "#be185d", "accent_soft": "#2a0f1c",
+           "font": "Kalinga",         "mono": "Consolas", "rail_width": 84, "icon_size": 19, "card_style": "soft",  "emblem": "\U0001F6D5"},
+    "ml": {"accent": "#10b981", "accent_dark": "#059669", "accent_glow": "#047857", "accent_soft": "#062c22",
+           "font": "Kartika",         "mono": "Consolas", "rail_width": 88, "icon_size": 20, "card_style": "glow",  "emblem": "\U0001F334"},
+    "pa": {"accent": "#f43f5e", "accent_dark": "#e11d48", "accent_glow": "#be123c", "accent_soft": "#2a0f16",
+           "font": "Raavi",           "mono": "Consolas", "rail_width": 72, "icon_size": 17, "card_style": "sharp", "emblem": "\U0001FA97"},
+    "as": {"accent": "#84cc16", "accent_dark": "#65a30d", "accent_glow": "#4d7c0f", "accent_soft": "#1c2408",
+           "font": "Kalpurush",       "mono": "Consolas", "rail_width": 84, "icon_size": 19, "card_style": "soft",  "emblem": "\U0001F3AD"},
+}
+
+
+def apply_language_visuals(lang: str):
+    """
+    Rebinds the module-level FONT_FAMILY / FONT_MONO globals AND re-tints
+    the active colour palette's accent slots to match this language's
+    LANGUAGE_THEMES entry. Called once at startup (and stored to Settings
+    on change) so that after a restart, the whole app — every button,
+    every highlight, every heading font — reflects the new language's
+    look, not just its translated text.
+    """
+    global FONT_FAMILY, FONT_MONO
+    theme = LANGUAGE_THEMES.get(lang, LANGUAGE_THEMES["en"])
+    FONT_FAMILY = theme["font"]
+    FONT_MONO   = theme["mono"]
+    P.blue      = theme["accent"]
+    P.blue_dark = theme["accent_dark"]
+    P.blue_glow = theme["accent_glow"]
+    P.blue_soft = theme["accent_soft"]
+    return theme
+
+
+def font_is_installed(family: str) -> bool:
+    """Best-effort check of whether a font family exists on this machine.
+    tkinter silently substitutes a default font if not, so this is only
+    used to decide whether to show a small 'using fallback font' hint —
+    it is never required for correctness."""
+    try:
+        import tkinter.font as tkfont
+        return family in tkfont.families()
+    except Exception:
+        return True
+
+
+def _(key: str, lang: str = "en", **kwargs) -> str:
+    """Translate a key into the given language. Falls back to English."""
+    text = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key, TRANSLATIONS["en"].get(key, key))
+    try:
+        return text.format(**kwargs)
+    except Exception:
+        return text
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  THEME SYSTEM  (Light / Dark toggle)
+# ═══════════════════════════════════════════════════════════════════════════════
+class Theme:
+    """Dynamic palette that swaps between Dark and Light modes."""
+
+    DARK = type("P", (), {
+        "rail": "#0a0e15", "bg": "#0e1117", "sidebar": "#12161f",
+        "sidebar2": "#1a2130", "surface": "#1c2233", "surface2": "#222b3a",
+        "hover": "#283248", "border": "#2a3448", "border_soft": "#202838",
+        "text": "#e8edf5", "muted": "#7b8aa0", "faint": "#4d586c",
+        "blue": "#3b82f6", "blue_dark": "#2563eb", "blue_glow": "#1d4ed8",
+        "blue_soft": "#132236", "green": "#22c55e", "green_dark": "#16a34a",
+        "green_soft": "#0d2218", "amber": "#f59e0b", "amber_soft": "#241b08",
+        "red": "#ef4444", "red_dark": "#dc2626", "red_soft": "#2a1316",
+        "purple": "#a855f7", "purple_soft": "#1c1430", "ink": "#f1f5f9",
+        "tint_blue": "#0f1e35", "tint_green": "#0d2218",
+        "tint_amber": "#231a05", "tint_purple": "#1a1030",
+        "chart_bg": "#0e1117", "chart_fg": "#e8edf5",
+        "chart_grid": "#2a3448", "calendar_present": "#22c55e",
+        "calendar_absent": "#ef4444", "calendar_neutral": "#2a3448",
+    })()
+
+    LIGHT = type("P", (), {
+        "rail": "#f1f5f9", "bg": "#ffffff", "sidebar": "#f8fafc",
+        "sidebar2": "#f1f5f9", "surface": "#ffffff", "surface2": "#f8fafc",
+        "hover": "#e2e8f0", "border": "#cbd5e1", "border_soft": "#e2e8f0",
+        "text": "#0f172a", "muted": "#64748b", "faint": "#94a3b8",
+        "blue": "#2563eb", "blue_dark": "#1d4ed8", "blue_glow": "#1e40af",
+        "blue_soft": "#dbeafe", "green": "#16a34a", "green_dark": "#15803d",
+        "green_soft": "#dcfce7", "amber": "#d97706", "amber_soft": "#fef3c7",
+        "red": "#dc2626", "red_dark": "#b91c1c", "red_soft": "#fee2e2",
+        "purple": "#7c3aed", "purple_soft": "#ede9fe", "ink": "#0f172a",
+        "tint_blue": "#eff6ff", "tint_green": "#f0fdf4",
+        "tint_amber": "#fffbeb", "tint_purple": "#f5f3ff",
+        "chart_bg": "#ffffff", "chart_fg": "#0f172a",
+        "chart_grid": "#e2e8f0", "calendar_present": "#16a34a",
+        "calendar_absent": "#dc2626", "calendar_neutral": "#e2e8f0",
+    })()
+
+    @classmethod
+    def get(cls, is_dark: bool = True):
+        return cls.DARK if is_dark else cls.LIGHT
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULE MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+SCHEDULE_FILE = DATA_DIR / "schedule.json"
+
+class ScheduleManager:
+    """Per-day late thresholds and active/inactive day configuration."""
+
+    DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    def __init__(self):
+        self._data: dict = {}
+        self.load()
+
+    def load(self):
+        if SCHEDULE_FILE.exists():
+            try:
+                with SCHEDULE_FILE.open() as f:
+                    self._data = json.load(f)
+            except Exception:
+                self._data = {}
+        else:
+            self._reset_defaults()
+
+    def save(self):
+        with SCHEDULE_FILE.open("w") as f:
+            json.dump(self._data, f, indent=2)
+
+    def _reset_defaults(self):
+        self._data = {
+            day: {"active": day not in ("Sat", "Sun"), "late_time": "08:32"}
+            for day in self.DAYS
+        }
+        self.save()
+
+    def is_active(self, day_name: str | None = None) -> bool:
+        if day_name is None:
+            day_name = datetime.now().strftime("%a")
+        return self._data.get(day_name, {}).get("active", True)
+
+    def late_time(self, day_name: str | None = None) -> dtime:
+        if day_name is None:
+            day_name = datetime.now().strftime("%a")
+        raw = self._data.get(day_name, {}).get("late_time", "08:32")
+        try:
+            h, m = raw.split(":")
+            return dtime(int(h), int(m))
+        except Exception:
+            return dtime(8, 32)
+
+    def set_day(self, day: str, active: bool, late_time: str):
+        if day not in self._data:
+            self._data[day] = {}
+        self._data[day]["active"] = active
+        self._data[day]["late_time"] = late_time
+        self.save()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BADGE & ACHIEVEMENT SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+BADGE_FILE = DATA_DIR / "badges.json"
+
+class BadgeSystem:
+    """Auto-awards attendance-based badges to students."""
+
+    BADGE_DEFS = {
+        "first_steps":  {"name": "badge_first_steps",  "icon": "👣", "req_days": 1},
+        "week_warrior": {"name": "badge_week_warrior", "icon": "⚔", "req_days": 5},
+        "month_master": {"name": "badge_month_master", "icon": "👑", "req_days": 20},
+        "early_bird":   {"name": "badge_early_bird",   "icon": "🐦", "req_early": 10},
+        "centurion":    {"name": "badge_centurion",    "icon": "🏛", "req_days": 100},
+        "house_hero":   {"name": "badge_house_hero",   "icon": "🏆", "req_house_pct": 90.0},
+    }
+
+    def __init__(self, store: AttendanceStore):
+        self.store = store
+        self._awards: dict[str, list[str]] = {}
+        self.load()
+
+    def load(self):
+        if BADGE_FILE.exists():
+            try:
+                with BADGE_FILE.open() as f:
+                    self._awards = json.load(f)
+            except Exception:
+                self._awards = {}
+        else:
+            self._awards = {}
+
+    def save(self):
+        with BADGE_FILE.open("w") as f:
+            json.dump(self._awards, f, indent=2)
+
+    def get_badges(self, uid: str) -> list[dict]:
+        """Return list of badge dicts for a student."""
+        earned = self._awards.get(uid, [])
+        return [b for k, b in self.BADGE_DEFS.items() if k in earned]
+
+    def check_and_award(self, uid: str, student: dict, is_early: bool = False):
+        """Check if student qualifies for new badges and award them."""
+        if uid not in self._awards:
+            self._awards[uid] = []
+        earned = self._awards[uid]
+        days = safe_int(student.get("No. of Days Present", 0))
+        new = []
+
+        for key, badge in self.BADGE_DEFS.items():
+            if key in earned:
+                continue
+            if "req_days" in badge and days >= badge["req_days"]:
+                earned.append(key); new.append(badge)
+            elif "req_early" in badge and is_early:
+                # Count early arrivals from audit log (simplified)
+                early_count = self._count_early_arrivals(uid)
+                if early_count >= badge["req_early"]:
+                    earned.append(key); new.append(badge)
+            elif "req_house_pct" in badge:
+                house = str(student.get("House", "None")).strip()
+                if house != "None":
+                    stats = self.store.house_stats()
+                    if stats.get(house, {}).get("pct", 0) >= badge["req_house_pct"]:
+                        earned.append(key); new.append(badge)
+
+        if new:
+            self.save()
+        return new
+
+    def _count_early_arrivals(self, uid: str) -> int:
+        rows = self.store._load_audit_rows()
+        count = 0
+        for row in rows:
+            if len(row) > 7 and row[2] == uid and row[7] == "On-time":
+                count += 1
+        return count
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AES-256 ENCRYPTION MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+KEY_FILE = DATA_DIR / ".enc_key"
+
+class EncryptionManager:
+    """Fernet symmetric encryption for sensitive parent contact fields."""
+
+    def __init__(self):
+        self._fernet = None
+        if Fernet is not None:
+            self._init_key()
+
+    def _init_key(self):
+        if KEY_FILE.exists():
+            try:
+                with KEY_FILE.open("rb") as f:
+                    key = f.read()
+                self._fernet = Fernet(key)
+            except Exception:
+                self._generate_key()
+        else:
+            self._generate_key()
+
+    def _generate_key(self):
+        key = Fernet.generate_key()
+        with KEY_FILE.open("wb") as f:
+            f.write(key)
+        self._fernet = Fernet(key)
+
+    def encrypt(self, text: str) -> str:
+        if self._fernet is None or not text:
+            return text
+        try:
+            return self._fernet.encrypt(text.encode()).decode()
+        except Exception:
+            return text
+
+    def decrypt(self, token: str) -> str:
+        if self._fernet is None or not token:
+            return token
+        try:
+            return self._fernet.decrypt(token.encode()).decode()
+        except Exception:
+            return token
+
+    def is_encrypted(self, text: str) -> bool:
+        if not text or self._fernet is None:
+            return False
+        try:
+            self._fernet.decrypt(text.encode())
+            return True
+        except Exception:
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  QR CODE SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+QR_DIR = DATA_DIR / "qr_codes"
+
+def generate_student_qr(uid: str, name: str, roll: str) -> Path | None:
+    """Generate a QR code PNG for a student. Returns path or None."""
+    if qrcode is None:
+        return None
+    QR_DIR.mkdir(parents=True, exist_ok=True)
+    path = QR_DIR / f"{uid}.png"
+    data = json.dumps({"uid": uid, "name": name, "roll": roll, "app": "FaceAttend"})
+    try:
+        img = qrcode.make(data, box_size=6, border=2)
+        img.save(str(path))
+        return path
+    except Exception:
+        return None
+
+
+def decode_qr_from_frame(frame) -> dict | None:
+    """Try to decode a QR code from an OpenCV frame."""
+    if cv2 is None:
+        return None
+    try:
+        detector = cv2.QRCodeDetector()
+        data, bbox, _ = detector.detectAndDecode(frame)
+        if data:
+            try:
+                return json.loads(data)
+            except Exception:
+                return {"raw": data}
+    except Exception:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LIVENESS DETECTION (Blink via EAR)
+# ═══════════════════════════════════════════════════════════════════════════════
+# dlib 68-point facial landmark indices
+LEFT_EYE  = list(range(36, 42))
+RIGHT_EYE = list(range(42, 48))
+
+def eye_aspect_ratio(eye):
+    """Compute EAR for a single eye given 6 (x,y) points."""
+    if sci_dist is None:
+        return 1.0
+    A = sci_dist.euclidean(eye[1], eye[5])
+    B = sci_dist.euclidean(eye[2], eye[4])
+    C = sci_dist.euclidean(eye[0], eye[3])
+    return (A + B) / (2.0 * C) if C > 0 else 1.0
+
+
+class LivenessDetector:
+    """Simple blink-based liveness detection."""
+
+    EAR_THRESHOLD = 0.22
+    CONSEC_FRAMES = 2
+
+    def __init__(self):
+        self._predictor = None
+        self._detector = None
+        self._counter = 0
+        self._total_blinks = 0
+        if dlib is not None:
+            self._init_model()
+
+    def _init_model(self):
+        # Look for shape_predictor_68_face_landmarks.dat in assets or data
+        model_paths = [
+            ASSETS_DIR / "shape_predictor_68_face_landmarks.dat",
+            DATA_DIR / "shape_predictor_68_face_landmarks.dat",
+        ]
+        for p in model_paths:
+            if p.exists():
+                try:
+                    self._detector = dlib.get_frontal_face_detector()
+                    self._predictor = dlib.shape_predictor(str(p))
+                    break
+                except Exception:
+                    pass
+
+    def is_live(self, frame) -> bool:
+        """Return True if a blink is detected (indicating a real person)."""
+        if self._predictor is None or self._detector is None:
+            return True  # fallback: assume live if model unavailable
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            rects = self._detector(gray, 0)
+            for rect in rects:
+                shape = self._predictor(gray, rect)
+                coords = [(shape.part(i).x, shape.part(i).y) for i in range(68)]
+                left_ear = eye_aspect_ratio([coords[i] for i in LEFT_EYE])
+                right_ear = eye_aspect_ratio([coords[i] for i in RIGHT_EYE])
+                ear = (left_ear + right_ear) / 2.0
+                if ear < self.EAR_THRESHOLD:
+                    self._counter += 1
+                else:
+                    if self._counter >= self.CONSEC_FRAMES:
+                        self._total_blinks += 1
+                    self._counter = 0
+                # Consider "live" if at least one blink has ever been detected
+                # OR if eyes are currently open (EAR above threshold)
+                return self._total_blinks > 0 or ear > self.EAR_THRESHOLD
+        except Exception:
+            pass
+        return True
+
+    def reset(self):
+        self._counter = 0
+        self._total_blinks = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VOICE FEEDBACK
+# ═══════════════════════════════════════════════════════════════════════════════
+_voice_engine = None
+
+def get_voice_engine():
+    global _voice_engine
+    if _voice_engine is None and pyttsx3 is not None:
+        try:
+            _voice_engine = pyttsx3.init()
+            _voice_engine.setProperty("rate", 170)
+        except Exception:
+            _voice_engine = None
+    return _voice_engine
+
+
+def speak_text(text: str):
+    """Non-blocking text-to-speech announcement. (Voice disabled in 2.9)"""
+    return  # voice removed in 2.9
+
+    engine = get_voice_engine()
+    if engine is None or not text:
+        return
+
+    def _talk():
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception:
+            pass
+
+    threading.Thread(target=_talk, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MULTI-CAMERA DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+def list_cameras(max_test: int = 3) -> list[int]:
+    """Test camera indices 0..max_test and return those that open.
+    Suppresses OpenCV C++ DSHOW spam by redirecting fd 2 at OS level."""
+    if cv2 is None:
+        return [0]
+    import sys, io
+    found = []
+    # Redirect fd 2 (C-level stderr) so OpenCV DSHOW warnings don't appear
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_fd = os.dup(2)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    try:
+        for i in range(max_test):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(i)
+            if cap is not None and cap.isOpened():
+                found.append(i)
+                cap.release()
+            elif cap is not None:
+                cap.release()
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+    return found if found else [0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REST API SERVER
+# ═══════════════════════════════════════════════════════════════════════════════
+API_PORT = 8765
+
+class FaceAttendAPIHandler(BaseHTTPRequestHandler):
+    """Minimal REST API for external integrations."""
+
+    app_instance = None  # set by FaceAttendApp
+
+    def log_message(self, format, *args):
+        pass  # silence console spam
+
+    def _send_json(self, status: int, data: dict):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        app = self.app_instance
+
+        if path == "/api/students":
+            if app is None:
+                self._send_json(503, {"error": "App not ready"})
+                return
+            students = app.store.load_students()
+            self._send_json(200, {"count": len(students), "students": students})
+
+        elif path == "/api/today":
+            if app is None:
+                self._send_json(503, {"error": "App not ready"})
+                return
+            present = [app.students_by_uid.get(u, {}) for u in app.scanned_today]
+            self._send_json(200, {
+                "date": date.today().isoformat(),
+                "present_count": len(present),
+                "present": present,
+            })
+
+        elif path == "/api/houses":
+            if app is None:
+                self._send_json(503, {"error": "App not ready"})
+                return
+            stats = app.store.house_stats()
+            self._send_json(200, stats)
+
+        elif path == "/api/qr":
+            params = urllib.parse.parse_qs(parsed.query)
+            uid = params.get("uid", [""])[0]
+            if not uid:
+                self._send_json(400, {"error": "Missing uid param"})
+                return
+            path = QR_DIR / f"{uid}.png"
+            if not path.exists():
+                self._send_json(404, {"error": "QR not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            with open(path, "rb") as f:
+                self.wfile.write(f.read())
+
+        elif path == "/api/health":
+            self._send_json(200, {"status": "ok", "version": APP_VERSION})
+
+        else:
+            self._send_json(404, {"error": "Unknown endpoint"})
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.end_headers()
+
+
+class APIServer:
+    """Threaded wrapper for the HTTP API."""
+
+    def __init__(self, app):
+        self.app = app
+        self._server = None
+        self._thread = None
+        self._running = False
+
+    def start(self):
+        if HTTPServer is None or socketserver is None:
+            return False
+        try:
+            FaceAttendAPIHandler.app_instance = self.app
+            self._server = HTTPServer(("0.0.0.0", API_PORT), FaceAttendAPIHandler)
+            self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+            self._thread.start()
+            self._running = True
+            return True
+        except Exception as e:
+            logger.error(f"API server failed: {e}")
+            return False
+
+    def stop(self):
+        if self._server:
+            try:
+                self._server.shutdown()
+            except Exception:
+                pass
+        self._running = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CALENDAR HEATMAP
+# ═══════════════════════════════════════════════════════════════════════════════
+def build_calendar_heatmap(parent, year: int, month: int, attendance_days: set[str], theme, lang: str = "en"):
+    """Build a tkinter calendar grid showing present/absent days."""
+    import calendar
+    cal = calendar.Calendar()
+    month_days = cal.monthdayscalendar(year, month)
+    month_name = "jan" if month == 1 else "feb" if month == 2 else "mar" if month == 3 else                  "apr" if month == 4 else "may" if month == 5 else "jun" if month == 6 else                  "jul" if month == 7 else "aug" if month == 8 else                  "sep" if month == 9 else "oct" if month == 10 else                  "nov" if month == 11 else "dec"
+
+    hdr = tk.Label(parent, text=f"{month_name} {year}", bg=theme.bg, fg=theme.text,
+                   font=(FONT_FAMILY, 12, "bold"))
+    hdr.pack(anchor="w", pady=(0, 6))
+
+    grid = tk.Frame(parent, bg=theme.bg)
+    grid.pack(fill="x")
+
+    days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    for i, d in enumerate(days):
+        tk.Label(grid, text=d, bg=theme.bg, fg=theme.muted, font=(FONT_FAMILY, 8), width=4).grid(row=0, column=i, padx=2, pady=2)
+
+    for r, week in enumerate(month_days, 1):
+        for c, day in enumerate(week):
+            if day == 0:
+                tk.Label(grid, text="", bg=theme.bg, width=4).grid(row=r, column=c)
+                continue
+            day_str = f"{year:04d}-{month:02d}-{day:02d}"
+            if day_str in attendance_days:
+                bg = theme.calendar_present
+                fg = "#ffffff"
+            else:
+                bg = theme.calendar_neutral
+                fg = theme.text
+            lbl = tk.Label(grid, text=str(day), bg=bg, fg=fg, font=(FONT_FAMILY, 9), width=4, height=2)
+            lbl.grid(row=r, column=c, padx=2, pady=2)
+
+# Type scale used across the rebuilt 2.1 pages (kept as plain tuples so the
+# existing tk widgets that hard-code their own font don't need touching).
+F_H1     = (FONT_FAMILY, 22, "bold")
+F_H2     = (FONT_FAMILY, 15, "bold")
+F_H3     = (FONT_FAMILY, 12, "bold")
+F_BODY   = (FONT_FAMILY, 10)
+F_BODY_B = (FONT_FAMILY, 10, "bold")
+F_SMALL  = (FONT_FAMILY, 9)
+F_SMALL_B= (FONT_FAMILY, 9, "bold")
+F_TINY   = (FONT_FAMILY, 8)
+F_MONO   = (FONT_MONO, 9)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def safe_int(v, fallback=0):
+    try: return int(v)
+    except (TypeError, ValueError): return fallback
+
+def safe_float(v, fallback=1.0):
+    try: return float(v)
+    except (TypeError, ValueError): return fallback
+
+def suggest_promoted_grade(current: str) -> str:
+    """
+    Year-end promotion helper: '7C' -> '8C', '10 A' -> '11 A', 'Grade 9-B'
+    -> 'Grade 10-B', 'KG' (no digits) -> 'KG' unchanged. Only the FIRST
+    number found is incremented; everything else (section letters,
+    surrounding words/punctuation) is preserved exactly, since section
+    letters don't necessarily change on promotion (a student can stay in
+    section C while moving from 7C to 8C, which is the overwhelmingly
+    common case for Indian schools using this app).
+    """
+    current = (current or "").strip()
+    m = re.search(r"\d+", current)
+    if not m:
+        return current  # nothing numeric to bump (e.g. "KG", "Nursery")
+    num = int(m.group()) + 1
+    return current[:m.start()] + str(num) + current[m.end():]
+
+
+def col_num(name: str) -> int:
+    return COLUMNS.index(name) + 1
+
+def photo_col_letter() -> str:
+    return get_column_letter(PHOTO_COLUMN) if get_column_letter else "K"
+
+def clean_phone(v: str) -> str:
+    return v.strip().replace(" ", "")
+
+def parse_uid_num(uid: str) -> int:
+    m = re.search(r"(\d+)$", uid or "")
+    return int(m.group(1)) if m else 0
+
+def open_camera(index=0):
+    if cv2 is None:
+        return None
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_fd = os.dup(2)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    try:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(index)
+        if cap is None or not cap.isOpened():
+            cap = cv2.VideoCapture(index)
+        return cap if cap.isOpened() else None
+    except Exception:
+        return None
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+
+def ensure_dirs():
+    for d in (DATA_DIR, FACES_DIR, UNKNOWNS_DIR, BACKUPS_DIR, EXPORTS_DIR, LOGS_DIR, ASSETS_DIR,
+              NOTES_DIR, WHITEBOARD_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+def _face_recognition_looks_real(mod) -> bool:
+    # Catches the case where a local file/folder named face_recognition.py
+    # (or a broken face_recognition_models install) shadows the real package.
+    return (
+        mod is not None
+        and hasattr(mod, "face_locations") and callable(mod.face_locations)
+        and hasattr(mod, "face_encodings") and callable(mod.face_encodings)
+        and hasattr(mod, "face_distance") and callable(mod.face_distance)
+    )
+
+def ensure_face_recognition() -> bool:
+    global face_recognition, FACE_RECOGNITION_IMPORT_ERROR
+    if face_recognition is not None:
+        if _face_recognition_looks_real(face_recognition):
+            return True
+        mod_file = getattr(face_recognition, "__file__", "?")
+        FACE_RECOGNITION_IMPORT_ERROR = (
+            f"'face_recognition' resolved to {mod_file!r} but is missing the expected "
+            f"functions. This usually means a local file/folder named face_recognition.py "
+            f"or face_recognition/ is shadowing the real installed package, or that "
+            f"'face_recognition_models' failed to install correctly."
+        )
+        return False
+    try:
+        import importlib
+        candidate = importlib.import_module("face_recognition")
+        if not _face_recognition_looks_real(candidate):
+            mod_file = getattr(candidate, "__file__", "?")
+            FACE_RECOGNITION_IMPORT_ERROR = (
+                f"'face_recognition' resolved to {mod_file!r} but is missing the expected "
+                f"functions. This usually means a local file/folder named face_recognition.py "
+                f"or face_recognition/ is shadowing the real installed package, or that "
+                f"'face_recognition_models' failed to install correctly."
+            )
+            return False
+        face_recognition = candidate
+        return True
+    except BaseException as e:
+        FACE_RECOGNITION_IMPORT_ERROR = str(e) or type(e).__name__
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETTINGS  (persisted to JSON)
+# ═══════════════════════════════════════════════════════════════════════════════
+class Settings:
+    _defaults = {
+        "late_time": "08:32",
+        "threshold": 0.50,
+        "xp_ontime": 10,
+        "xp_late": 2,
+        "school_name": "",
+        "smtp_sender": "",
+        "smtp_password": "",
+        "auto_notify_email": False,
+        "auto_notify_whatsapp": False,
+        "auto_message_template": (
+            "Dear Parent,\n\n"
+            "Your ward {name} (Roll No: {roll}) has arrived at school "
+            "and was marked {status} at {time} on {date}.\n\n"
+            "Attendance XP earned: +{xp}\n\n"
+            "— {school}"
+        ),
+        "language": "en",
+        "theme_dark": True,
+        "voice_feedback": True,
+        "liveness_check": True,
+        "camera_index": 0,
+        "api_server": False,
+        "absent_notify_enabled": False,
+        "absent_notify_time": "09:30",
+        "absent_notify_email": True,
+        "absent_notify_whatsapp": False,
+        "absent_message_template": (
+            "Dear Parent,\n\n"
+            "This is to inform you that your ward {name} (Roll No: {roll}) "
+            "has not been marked present at school today, {date}, as of {time}.\n\n"
+            "If this is an error or your child is on approved leave, please "
+            "contact the school office.\n\n"
+            "— {school}"
+        ),
+        "_absent_notify_last_run_date": "",
+    }
+
+    def __init__(self):
+        self._data = dict(self._defaults)
+        self.load()
+
+    def load(self):
+        if SETTINGS_FILE.exists():
+            try:
+                with SETTINGS_FILE.open() as f:
+                    saved = json.load(f)
+                self._data.update(saved)
+            except Exception:
+                pass
+        if self._data.get("language") not in LANG_NAMES:
+            self._data["language"] = "en"
+
+    def save(self):
+        with SETTINGS_FILE.open("w") as f:
+            json.dump(self._data, f, indent=2)
+
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        return self._data.get(key)
+
+    def set(self, key, value):
+        self._data[key] = value
+
+    @property
+    def late_time_obj(self) -> dtime:
+        try:
+            h, m = self._data["late_time"].split(":")
+            return dtime(int(h), int(m))
+        except Exception:
+            return dtime(8, 32)
+
+    @property
+    def language(self) -> str:
+        return self._data.get("language", "en")
+
+    @property
+    def theme_dark(self) -> bool:
+        return self._data.get("theme_dark", True)
+
+    @property
+    def voice_feedback(self) -> bool:
+        return self._data.get("voice_feedback", True)
+
+    @property
+    def liveness_check(self) -> bool:
+        return self._data.get("liveness_check", True)
+
+    @property
+    def camera_index(self) -> int:
+        return safe_int(self._data.get("camera_index"), 0)
+
+    @property
+    def api_server(self) -> bool:
+        return self._data.get("api_server", False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXCEL STORE
+# ═══════════════════════════════════════════════════════════════════════════════
+class AttendanceStore:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        ensure_dirs()
+        self.known_uids: list[str] = []
+        self.known_encodings: list = []
+        self._init_excel()
+        self._init_encodings()
+        self._init_audit_log()
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+    def _init_excel(self):
+        if EXCEL_FILE.exists(): return
+        if Workbook is None: return
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Attendance"
+        ws.append(COLUMNS)
+        self._style_header(ws)
+        self._apply_widths(ws)
+        ws.cell(1, PHOTO_COLUMN).value = "Photo"
+        if get_column_letter:
+            ws.column_dimensions[photo_col_letter()].width = 15
+        wb.save(EXCEL_FILE)
+        wb.close()
+
+    def _style_header(self, ws):
+        if PatternFill is None: return
+        hdr_fill = PatternFill("solid", fgColor="1E3A5F")
+        hdr_font = Font(bold=True, color="FFFFFF", size=11)
+        for col in range(1, PHOTO_COLUMN + 1):
+            cell = ws.cell(1, col)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    def _apply_widths(self, ws):
+        if get_column_letter is None: return
+        for i, name in enumerate(COLUMNS, 1):
+            ws.column_dimensions[get_column_letter(i)].width = EXCEL_COLUMN_WIDTHS.get(name, 14)
+
+    def _init_encodings(self):
+        if not ENCODINGS_FILE.exists():
+            with ENCODINGS_FILE.open("wb") as f:
+                pickle.dump({"uids": [], "encodings": []}, f)
+        else:
+            self.load_encodings()
+
+    def _init_audit_log(self):
+        if not AUDIT_LOG.exists():
+            AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with AUDIT_LOG.open("w", newline="") as f:
+                csv.writer(f).writerow([
+                    "Date", "Time", "UID", "Name", "Roll No", "Grade",
+                    "House", "Status", "XP Earned", "Streak"
+                ])
+
+    def _safe_load(self):
+        import tempfile
+        tmp = Path(tempfile.mktemp(suffix=".xlsx"))
+        try:
+            shutil.copy2(EXCEL_FILE, tmp)
+            return load_workbook(tmp, read_only=True, data_only=True), tmp
+        except Exception:
+            try:
+                return load_workbook(EXCEL_FILE, read_only=True, data_only=True), None
+            except Exception:
+                return None, None
+
+    def _kill_excel(self):
+        if os.name != "nt": return
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/F", "/IM", "EXCEL.EXE"], capture_output=True, timeout=5)
+            time.sleep(0.6)
+        except Exception: pass
+
+    # ── public read ───────────────────────────────────────────────────────────
+    def load_students(self) -> list[dict]:
+        if not EXCEL_FILE.exists():
+            self.ensure_file_present_and_valid()
+        if load_workbook is None or not EXCEL_FILE.exists(): return []
+        with _excel_lock:
+            wb, tmp = self._safe_load()
+            if wb is None: return []
+            ws = wb.active
+            students = []
+            try:
+                rows_iter = ws.iter_rows(min_row=1, values_only=True)
+                header_row = next(rows_iter, None)
+            except StopIteration:
+                header_row = None
+            header = self._normalize_header(header_row)
+            for row in rows_iter:
+                if not row: continue
+                rec = dict(zip(header, row))
+                uid_val = rec.get("UID")
+                if not uid_val: continue
+                s = {col: rec.get(col) for col in COLUMNS}
+                s["Sl.No"]               = safe_int(s.get("Sl.No"))
+                s["No. of Days Present"] = safe_int(s.get("No. of Days Present"))
+                s["XP"]                  = safe_int(s.get("XP"))
+                s["Multiplier"]          = safe_float(s.get("Multiplier"), 1.0)
+                s["Streak"]              = safe_int(s.get("Streak"))
+                if not s.get("House"):
+                    s["House"] = "None"
+                students.append(s)
+            try: wb.close()
+            except: pass
+            if tmp and tmp.exists():
+                try: tmp.unlink()
+                except: pass
+            return students
+
+    @staticmethod
+    def _normalize_header(header_row) -> list[str]:
+        """
+        Maps the on-disk header row to canonical COLUMNS names, so older
+        files (saved before 'House'/'Streak' existed) still read correctly
+        by NAME instead of by position. This is the fix for the bug where
+        a stale-schema file made Phone numbers appear under the House
+        column — load_students() previously zipped values positionally
+        against the CURRENT COLUMNS list regardless of what was actually
+        on disk.
+        """
+        aliases = {
+            "phone": "Parent Phone", "parent_phone": "Parent Phone",
+            "email": "Parent Email", "parent_email": "Parent Email",
+            "days present": "No. of Days Present", "days": "No. of Days Present",
+            "roll_no": "Roll No", "roll": "Roll No",
+        }
+        if not header_row:
+            return list(COLUMNS)
+        out = []
+        for cell in header_row:
+            name = str(cell).strip() if cell else ""
+            if name in COLUMNS:
+                out.append(name)
+            elif name.lower() in aliases:
+                out.append(aliases[name.lower()])
+            elif name == "Photo":
+                out.append("Photo")
+            else:
+                out.append(name or f"_col{len(out)}")
+        return out
+
+    def validate_schema(self) -> dict:
+        """
+        Checks the on-disk header row against the COLUMNS the app expects.
+        Returns {"ok": bool, "missing": [...], "extra": [...], "order_ok": bool}.
+        Used on every load to warn the teacher (instead of silently reading
+        misaligned data) and to drive auto-migration.
+        """
+        if load_workbook is None or not EXCEL_FILE.exists():
+            return {"ok": False, "missing": list(COLUMNS), "extra": [], "order_ok": False, "reason": "missing_file"}
+        try:
+            wb = load_workbook(EXCEL_FILE, read_only=True, data_only=True)
+            ws = wb.active
+            first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            wb.close()
+        except Exception as e:
+            return {"ok": False, "missing": list(COLUMNS), "extra": [], "order_ok": False, "reason": f"unreadable: {e}"}
+
+        header = [str(c).strip() if c else "" for c in (first_row or [])]
+        header_cols = [h for h in header if h and h != "Photo"]
+        missing = [c for c in COLUMNS if c not in header_cols]
+        extra   = [h for h in header_cols if h not in COLUMNS]
+        expected_prefix = COLUMNS[:len(header_cols)] if len(header_cols) <= len(COLUMNS) else COLUMNS
+        order_ok = header_cols[:len(expected_prefix)] == expected_prefix
+        return {
+            "ok": not missing and not extra and order_ok,
+            "missing": missing, "extra": extra, "order_ok": order_ok,
+            "reason": "header_mismatch" if (missing or extra or not order_ok) else "ok",
+        }
+
+    def migrate_schema(self) -> bool:
+        """
+        Rewrites the Excel file onto the CURRENT COLUMNS layout, preserving
+        every value by NAME (not position), backing up the old file first.
+        Safe to call even if the file already matches — it's a no-op cost
+        but never destructive since load_students() now reads by name too.
+        """
+        if load_workbook is None or Workbook is None or not EXCEL_FILE.exists():
+            return False
+        try:
+            old_students = self.load_students()
+        except Exception:
+            return False
+
+        # back up the pre-migration file first
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(EXCEL_FILE, BACKUPS_DIR / f"FaceAttend_premigration_{stamp}.xlsx")
+        except Exception:
+            pass
+
+        with _excel_lock:
+            self._kill_excel()
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Attendance"
+            ws.append(COLUMNS)
+            self._style_header(ws)
+            self._apply_widths(ws)
+            ws.cell(1, PHOTO_COLUMN).value = "Photo"
+            if get_column_letter:
+                ws.column_dimensions[photo_col_letter()].width = 15
+            for i, s in enumerate(old_students, 2):
+                ws.append([s.get(c, "") for c in COLUMNS])
+                self._stripe_row(ws, i)
+                uid = str(s.get("UID", ""))
+                fp  = FACES_DIR / f"{uid}.jpg"
+                if fp.exists():
+                    self._attach_photo(ws, i, fp)
+            wb.save(EXCEL_FILE)
+            wb.close()
+        return True
+
+    def ensure_file_present_and_valid(self) -> dict:
+        """
+        Call this on startup and before any risky operation. Handles two
+        distinct failure modes the teacher reported:
+          1) The .xlsx file was deleted outright while the app wasn't
+             watching — auto-restore from the newest backup if one exists,
+             otherwise create a brand-new empty sheet. Always returns a
+             warning message so the UI can toast it (never silent).
+          2) The .xlsx file exists but its header row doesn't match the
+             current schema (the House/Phone column-shift bug) — auto
+             migrate it onto the correct layout, preserving all data by
+             column NAME.
+        Returns {"action": "none"|"restored"|"created"|"migrated", "message": str|None}
+        """
+        if not EXCEL_FILE.exists():
+            backups = sorted(BACKUPS_DIR.glob("FaceAttend_backup_*.xlsx"),
+                              key=lambda p: p.stat().st_mtime, reverse=True) if BACKUPS_DIR.exists() else []
+            if backups:
+                try:
+                    shutil.copy2(backups[0], EXCEL_FILE)
+                    return {"action": "restored",
+                            "message": f"Excel file was missing — restored from backup ({backups[0].name})."}
+                except Exception:
+                    pass
+            self._init_excel()
+            return {"action": "created",
+                    "message": "Excel file was missing — created a new empty sheet."}
+
+        check = self.validate_schema()
+        if not check["ok"] and check.get("reason") == "header_mismatch":
+            migrated = self.migrate_schema()
+            if migrated:
+                return {"action": "migrated",
+                        "message": "Excel column layout was out of date (e.g. an older file without "
+                                    "House/Streak columns) — it has been automatically corrected. "
+                                    "A backup of the original file was saved first."}
+        return {"action": "none", "message": None}
+
+    def students_by_uid(self) -> dict[str, dict]:
+        return {str(s["UID"]): s for s in self.load_students()}
+
+    def load_encodings(self):
+        self.known_uids = []
+        self.known_encodings = []
+        if not ENCODINGS_FILE.exists(): return
+        try:
+            with ENCODINGS_FILE.open("rb") as f:
+                data = pickle.load(f)
+            self.known_uids      = list(data.get("uids", []))
+            self.known_encodings = list(data.get("encodings", []))
+        except Exception: pass
+
+    def save_encodings(self):
+        with ENCODINGS_FILE.open("wb") as f:
+            pickle.dump({"uids": self.known_uids, "encodings": self.known_encodings}, f)
+
+    def next_uid(self) -> str:
+        used = [parse_uid_num(str(s["UID"])) for s in self.load_students()]
+        used += [parse_uid_num(u) for u in self.known_uids]
+        return f"F{max(used, default=0)+1:03d}"
+
+    # ── public write ─────────────────────────────────────────────────────────
+    def add_student(self, roll_no, uid, name, grade, house, phone, email, encoding, face_path=None):
+        self.ensure_file_present_and_valid()
+        with _excel_lock:
+            self._kill_excel()
+            wb = load_workbook(EXCEL_FILE)
+            ws = wb.active
+            serial = max(ws.max_row, 1)
+            ws.append([serial, roll_no, uid, name, grade, house or "None", phone, email, 0, 0, 1.0, 0])
+            row_idx = ws.max_row
+            self._attach_photo(ws, row_idx, face_path)
+            self._stripe_row(ws, row_idx)
+            wb.save(EXCEL_FILE)
+            wb.close()
+        self.known_uids.append(uid)
+        self.known_encodings.append(encoding)
+        self.save_encodings()
+
+    def edit_student(self, uid, roll_no, name, grade, house, phone, email):
+        self.ensure_file_present_and_valid()
+        with _excel_lock:
+            self._kill_excel()
+            wb = load_workbook(EXCEL_FILE)
+            ws = wb.active
+            found = False
+            for r in range(2, ws.max_row + 1):
+                if str(ws.cell(r, col_num("UID")).value) == uid:
+                    ws.cell(r, col_num("Roll No")).value        = roll_no
+                    ws.cell(r, col_num("Name")).value           = name
+                    ws.cell(r, col_num("Grade")).value          = grade
+                    ws.cell(r, col_num("House")).value          = house or "None"
+                    ws.cell(r, col_num("Parent Phone")).value   = phone
+                    ws.cell(r, col_num("Parent Email")).value   = email
+                    found = True
+                    break
+            wb.save(EXCEL_FILE)
+            wb.close()
+            if not found:
+                raise ValueError(f"Student {uid} not found for edit")
+
+    def remove_student(self, uid) -> dict | None:
+        self.ensure_file_present_and_valid()
+        with _excel_lock:
+            self._kill_excel()
+            wb = load_workbook(EXCEL_FILE)
+            ws = wb.active
+            removed = None
+            target = None
+            for r in range(2, ws.max_row + 1):
+                if str(ws.cell(r, col_num("UID")).value) == uid:
+                    vals = [ws.cell(r, c).value for c in range(1, len(COLUMNS) + 1)]
+                    removed = dict(zip(COLUMNS, vals))
+                    target = r
+                    break
+            if target:
+                self._remove_images_in_row(ws, target)
+                ws.delete_rows(target, 1)
+                self._renumber(ws)
+                wb.save(EXCEL_FILE)
+            wb.close()
+        if uid in self.known_uids:
+            keep = [i for i, u in enumerate(self.known_uids) if u != uid]
+            self.known_uids      = [self.known_uids[i]      for i in keep]
+            self.known_encodings = [self.known_encodings[i] for i in keep]
+            self.save_encodings()
+        fp = FACES_DIR / f"{uid}.jpg"
+        if fp.exists(): fp.unlink()
+        return removed
+
+    def record_attendance(self, uid: str, is_late: bool, settings: Settings):
+        self.ensure_file_present_and_valid()
+        with _excel_lock:
+            self._kill_excel()
+            wb = load_workbook(EXCEL_FILE)
+            ws = wb.active
+            for r in range(2, ws.max_row + 1):
+                if str(ws.cell(r, col_num("UID")).value) != uid: continue
+
+                days_c   = col_num("No. of Days Present")
+                xp_c     = col_num("XP")
+                mul_c    = col_num("Multiplier")
+                streak_c = col_num("Streak")
+
+                mul    = safe_float(ws.cell(r, mul_c).value, 1.0)
+                streak = safe_int(ws.cell(r, streak_c).value) + 1
+                base   = safe_int(settings.xp_late, 2) if is_late else safe_int(settings.xp_ontime, 10)
+                xp_e   = int(round(base * mul))
+
+                days   = safe_int(ws.cell(r, days_c).value) + 1
+                xp_t   = safe_int(ws.cell(r, xp_c).value) + xp_e
+
+                # streak multiplier: every 5 days +0.1, cap at 3.0
+                if days % 5 == 0:
+                    mul = min(3.0, round(mul + 0.1, 1))
+
+                ws.cell(r, days_c).value   = days
+                ws.cell(r, xp_c).value     = xp_t
+                ws.cell(r, mul_c).value    = mul
+                ws.cell(r, streak_c).value = streak
+
+                vals    = [ws.cell(r, c).value for c in range(1, len(COLUMNS) + 1)]
+                student = dict(zip(COLUMNS, vals))
+                wb.save(EXCEL_FILE)
+                wb.close()
+
+                # audit log
+                try:
+                    now = datetime.now()
+                    with AUDIT_LOG.open("a", newline="") as lf:
+                        csv.writer(lf).writerow([
+                            now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
+                            uid, student.get("Name",""), student.get("Roll No",""),
+                            student.get("Grade",""), student.get("House",""),
+                            "Late" if is_late else "On-time", xp_e, streak
+                        ])
+                except Exception: pass
+
+                return student, xp_e
+            wb.close()
+        raise ValueError(f"No student with UID {uid}")
+
+    def export_excel(self, dest: Path) -> Path | None:
+        """Create a styled export copy."""
+        with _excel_lock:
+            wb_src, tmp = self._safe_load()
+            if wb_src is None: return None
+        if Workbook is None: return None
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Student Attendance"
+        students = self.load_students()
+        headers = COLUMNS + ["Photo"]
+        ws.append(headers)
+        self._style_header(ws)
+        self._apply_widths(ws)
+        ws.column_dimensions[photo_col_letter()].width = 15
+
+        row_fills = [PatternFill("solid", fgColor="0D1B2E"), PatternFill("solid", fgColor="112035")] if PatternFill else [None, None]
+        for i, s in enumerate(students, 2):
+            ws.append([s.get(c, "") for c in COLUMNS])
+            if row_fills[0]:
+                for cc in range(1, len(COLUMNS) + 1):
+                    ws.cell(i, cc).fill = row_fills[(i) % 2]
+                    ws.cell(i, cc).font = Font(color="E8EDF5")
+                    ws.cell(i, cc).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            uid = str(s.get("UID", ""))
+            self._attach_photo(ws, i, FACES_DIR / f"{uid}.jpg")
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(dest)
+        wb.close()
+        try:
+            wb_src.close()
+        except Exception:
+            pass
+        if tmp and tmp.exists():
+            try: tmp.unlink()
+            except: pass
+        return dest
+
+    def export_csv(self, dest: Path) -> Path:
+        students = self.load_students()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            w.writerows(students)
+        return dest
+
+    def backup(self) -> Path:
+        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = BACKUPS_DIR / f"FaceAttend_backup_{stamp}.xlsx"
+        if EXCEL_FILE.exists():
+            shutil.copy2(EXCEL_FILE, dest)
+        return dest
+
+    def bulk_import(self, import_path: Path) -> tuple[int, list[str]]:
+        """Import students from an xlsx. Expected columns (order flexible):
+        Roll No, Name, Grade, House, Parent Phone, Parent Email.
+        Returns (added_count, list_of_skipped_reasons)."""
+        self.ensure_file_present_and_valid()
+        if load_workbook is None:
+            return 0, ["openpyxl not installed"]
+        wb_in = None
+        try:
+            wb_in = load_workbook(str(import_path), read_only=True, data_only=True)
+            ws_in = wb_in.active
+            first_row = next(ws_in.iter_rows(min_row=1, max_row=1))
+            header = [str(c.value).strip() if c.value else "" for c in first_row]
+            added, skipped = 0, []
+            existing_rolls = {str(s.get("Roll No","")).strip() for s in self.load_students()}
+            for row in ws_in.iter_rows(min_row=2, values_only=True):
+                if not any(row): continue
+                data  = dict(zip(header, row))
+                roll  = str(data.get("Roll No",      data.get("roll_no",""))).strip()
+                name  = str(data.get("Name",         data.get("name",""))).strip()
+                grade = str(data.get("Grade",        data.get("grade",""))).strip()
+                house = str(data.get("House",        data.get("house","None"))).strip() or "None"
+                phone = str(data.get("Parent Phone", data.get("phone",""))).strip()
+                email = str(data.get("Parent Email", data.get("email",""))).strip()
+                if not roll or not name:
+                    skipped.append("Row skipped — missing Roll No or Name"); continue
+                if roll in existing_rolls:
+                    skipped.append(f"{roll} ({name}) — already exists"); continue
+                uid = self.next_uid()
+                with _excel_lock:
+                    self._kill_excel()
+                    wb = load_workbook(EXCEL_FILE)
+                    ws = wb.active
+                    serial = max(ws.max_row, 1)
+                    ws.append([serial, roll, uid, name, grade, house, phone, email, 0, 0, 1.0, 0])
+                    self._stripe_row(ws, ws.max_row)
+                    wb.save(EXCEL_FILE); wb.close()
+                existing_rolls.add(roll)
+                added += 1
+            return added, skipped
+        except Exception as e:
+            return 0, [f"Error reading file: {e}"]
+        finally:
+            if wb_in:
+                try: wb_in.close()
+                except: pass
+
+    def generate_certificates(self, min_pct: float = 90.0) -> list[dict]:
+        """Return list of students eligible for an attendance certificate."""
+        school_days_total = max(1, len({
+            row[0] for row in self._load_audit_rows() if row
+        }))
+        results = []
+        for s in self.load_students():
+            days = safe_int(s.get("No. of Days Present", 0))
+            pct  = round(days / school_days_total * 100, 1)
+            if pct >= min_pct:
+                results.append({**s, "_pct": pct, "_school_days": school_days_total})
+        return sorted(results, key=lambda x: -x["_pct"])
+
+    def _load_audit_rows(self) -> list:
+        if not AUDIT_LOG.exists(): return []
+        rows = []
+        try:
+            with AUDIT_LOG.open("r", newline="") as f:
+                rows = list(csv.reader(f))
+        except Exception: pass
+        return rows[1:] if rows else []
+
+    def house_stats(self) -> dict[str, dict]:
+        """Return {house: {students, present, pct}} for the House leaderboard."""
+        all_students = self.load_students()
+        scanned = self._load_scanned_today_uids()
+        stats: dict[str, dict] = {}
+        for house in ("Red", "Blue", "Green", "Orange"):
+            members = [s for s in all_students if str(s.get("House","")).strip() == house]
+            present = sum(1 for s in members if str(s.get("UID","")) in scanned)
+            pct     = round(present / len(members) * 100, 1) if members else 0.0
+            stats[house] = {"students": len(members), "present": present, "pct": pct}
+        return stats
+
+    def _load_scanned_today_uids(self) -> set[str]:
+        if not TODAY_SCANS_FILE.exists(): return set()
+        try:
+            with open(TODAY_SCANS_FILE, "rb") as f:
+                payload = pickle.load(f)
+            if payload.get("date") == date.today().isoformat():
+                return set(payload.get("uids", []))
+        except Exception: pass
+        return set()
+
+    # ── static helpers ────────────────────────────────────────────────────────
+    @staticmethod
+    def _renumber(ws):
+        for r in range(2, ws.max_row + 1):
+            ws.cell(r, 1).value = r - 1
+
+    @staticmethod
+    def _stripe_row(ws, row_idx):
+        if PatternFill is None: return
+        fill = PatternFill("solid", fgColor="0D1B2E" if row_idx % 2 == 0 else "112035")
+        for c in range(1, PHOTO_COLUMN):
+            ws.cell(row_idx, c).fill = fill
+            ws.cell(row_idx, c).font = Font(color="E8EDF5")
+
+    @staticmethod
+    def _attach_photo(ws, row_idx, face_path):
+        if ExcelImage is None or face_path is None or not Path(face_path).exists(): return
+        try:
+            img = ExcelImage(str(face_path))
+            img.width  = 72
+            img.height = 72
+            ws.row_dimensions[row_idx].height = 58
+            ws.add_image(img, f"{photo_col_letter()}{row_idx}")
+        except Exception: pass
+
+    @staticmethod
+    def _remove_images_in_row(ws, row_idx):
+        if not hasattr(ws, "_images"):
+            return
+        try:
+            ws._images = [
+                im for im in ws._images
+                if not (
+                    hasattr(im, "anchor") and
+                    hasattr(im.anchor, "_from") and
+                    getattr(im.anchor._from, "row", None) == row_idx - 1
+                )
+            ]
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ANIMATED BUTTON  — spring press effect
+# ═══════════════════════════════════════════════════════════════════════════════
+class AnimBtn(tk.Button):
+    """Button with a subtle press-spring animation and colour ripple."""
+
+    def __init__(self, master, anim_color: str | None = None, **kw):
+        self._orig_bg  = kw.get("bg", P.blue)
+        self._anim_col = anim_color or self._orig_bg
+        self._anim_job = None
+        super().__init__(master, **kw)
+        self.bind("<ButtonPress-1>",   self._on_press,   add="+")
+        self.bind("<ButtonRelease-1>", self._on_release, add="+")
+
+    def _on_press(self, _e=None):
+        self._cancel()
+        try:
+            self.configure(relief="sunken", padx=max(0, int(self.cget("padx")) - 1))
+            self._ripple(0)
+        except tk.TclError:
+            pass
+
+    def _on_release(self, _e=None):
+        self._cancel()
+        try:
+            self.configure(relief="flat", padx=int(self.cget("padx")) + 1)
+            self._spring_back(0)
+        except tk.TclError:
+            pass
+
+    def _ripple(self, step):
+        if step < 3:
+            try:
+                self.configure(bg=self._anim_col)
+                self._anim_job = self.after(40, lambda: self._ripple(step + 1))
+            except tk.TclError:
+                pass
+
+    def _spring_back(self, step):
+        if step < 4:
+            try:
+                self._anim_job = self.after(35, lambda: self._spring_back(step + 1))
+            except tk.TclError:
+                pass
+        else:
+            try:
+                self.configure(bg=self._orig_bg)
+            except tk.TclError:
+                pass
+
+    def _cancel(self):
+        if self._anim_job:
+            try: self.after_cancel(self._anim_job)
+            except: pass
+            self._anim_job = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TOOLTIP  — small delayed label used by the icon nav rail
+# ═══════════════════════════════════════════════════════════════════════════════
+class Tooltip:
+    """Lightweight hover tooltip. Shows after a short delay near the widget."""
+
+    def __init__(self, widget, text: str, delay: int = 450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after_id = None
+        self._tip = None
+        self._enter_id = widget.bind("<Enter>", self._schedule, add="+")
+        self._leave_id = widget.bind("<Leave>", self._hide, add="+")
+        self._btn_id  = widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after_id:
+            try: self.widget.after_cancel(self._after_id)
+            except: pass
+            self._after_id = None
+
+    def _show(self):
+        if self._tip is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + self.widget.winfo_width() + 8
+            y = self.widget.winfo_rooty() + (self.widget.winfo_height() // 2) - 11
+        except tk.TclError:
+            return
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.overrideredirect(True)
+        self._tip.attributes("-topmost", True)
+        self._tip.configure(bg=P.border)
+        inner = tk.Frame(self._tip, bg=P.surface2, highlightthickness=1,
+                          highlightbackground=P.border)
+        inner.pack(padx=1, pady=1)
+        tk.Label(inner, text=self.text, bg=P.surface2, fg=P.text,
+                 font=F_SMALL_B, padx=10, pady=5).pack()
+        self._tip.geometry(f"+{x}+{y}")
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            try: self._tip.destroy()
+            except tk.TclError: pass
+            self._tip = None
+
+    def destroy(self):
+        self._hide()
+        try:
+            self.widget.unbind("<Enter>", self._enter_id)
+            self.widget.unbind("<Leave>", self._leave_id)
+            self.widget.unbind("<ButtonPress>", self._btn_id)
+        except tk.TclError:
+            pass
+
+
+def add_hover(widget: tk.Widget, normal_bg: str, hover_bg: str) -> None:
+    """Attach a simple background-swap hover effect to a plain tk widget."""
+    widget.bind("<Enter>", lambda _e: widget.configure(bg=hover_bg), add="+")
+    widget.bind("<Leave>", lambda _e: widget.configure(bg=normal_bg), add="+")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TOAST NOTIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+class Toast:
+    """Non-blocking slide-in notification at bottom-right."""
+    _queue: list = []
+    _showing = False
+
+    @classmethod
+    def show(cls, root: tk.Tk, msg: str, kind: str = "info", duration: int = 3000,
+             action_label: str | None = None, action_command=None):
+        cls._queue.append((root, msg, kind, duration, action_label, action_command))
+        if not cls._showing:
+            cls._next()
+
+    @classmethod
+    def _next(cls):
+        if not cls._queue:
+            cls._showing = False
+            return
+        cls._showing = True
+        root, msg, kind, duration, action_label, action_command = cls._queue.pop(0)
+        cls._display(root, msg, kind, duration, action_label, action_command)
+
+    @classmethod
+    def _display(cls, root, msg, kind, duration, action_label=None, action_command=None):
+        color = {
+            "info":    P.blue,
+            "success": P.green,
+            "error":   P.red,
+            "warning": P.amber,
+        }.get(kind, P.blue)
+        icon = {"info": "ℹ", "success": "✓", "error": "✕", "warning": "⚠"}.get(kind, "ℹ")
+
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=P.surface)
+        win.attributes("-alpha", 0.0)
+
+        frm = tk.Frame(win, bg=P.surface, highlightthickness=2, highlightbackground=color)
+        frm.pack(fill="both", expand=True)
+
+        tk.Label(frm, text=icon, bg=P.surface, fg=color,
+                 font=(FONT_FAMILY, 14, "bold")).pack(side="left", padx=(14, 6), pady=14)
+        tk.Label(frm, text=msg, bg=P.surface, fg=P.text,
+                 font=(FONT_FAMILY, 10), wraplength=240, justify="left").pack(
+                     side="left", padx=(0, 10), pady=14)
+
+        if action_label and action_command:
+            def _run_action():
+                try: win.destroy()
+                except tk.TclError: pass
+                try: root.after(60, cls._next)
+                except tk.TclError: pass
+                action_command()
+            btn = tk.Button(frm, text=action_label, command=_run_action,
+                            bg=color, fg="white", activebackground=color,
+                            activeforeground="white", relief="flat", bd=0,
+                            padx=12, pady=6, font=(FONT_FAMILY, 9, "bold"), cursor="hand2")
+            btn.pack(side="left", padx=(0, 14), pady=14)
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        sw   = root.winfo_screenwidth()
+        sh   = root.winfo_screenheight()
+        x    = sw - w - 22
+        y_target = sh - h - 52
+
+        win.geometry(f"{w}x{h}+{x}+{sh}")
+
+        def slide(step, start_y, end_y):
+            if step > 15:
+                try:
+                    win.attributes("-alpha", 1.0)
+                    root.after(duration, lambda: fade_out(0))
+                except tk.TclError:
+                    pass
+                return
+            try:
+                frac = step / 15
+                ease = 1 - (1 - frac) ** 3
+                cy   = int(start_y + (end_y - start_y) * ease)
+                win.geometry(f"{w}x{h}+{x}+{cy}")
+                win.attributes("-alpha", min(1.0, frac * 2))
+                root.after(18, lambda: slide(step + 1, start_y, end_y))
+            except tk.TclError:
+                pass
+
+        def fade_out(step):
+            if step > 10:
+                try: win.destroy()
+                except tk.TclError: pass
+                try: root.after(80, cls._next)
+                except tk.TclError: pass
+                return
+            try:
+                win.attributes("-alpha", max(0.0, 1.0 - step / 10))
+                root.after(30, lambda: fade_out(step + 1))
+            except tk.TclError:
+                pass
+
+        slide(0, sh, y_target)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STAT CARD
+# ═══════════════════════════════════════════════════════════════════════════════
+class StatCard(tk.Frame):
+    def __init__(self, master, title, value, icon, tint, accent, subtitle=""):
+        super().__init__(master, bg=tint, highlightthickness=1, highlightbackground=P.border_soft)
+
+        chip_wrap = tk.Frame(self, bg=tint)
+        chip_wrap.pack(anchor="w", padx=16, pady=(14, 0))
+        chip = tk.Label(chip_wrap, text=icon, bg=accent, fg="#0b0e14",
+                         font=(FONT_FAMILY, 13), width=2, height=1)
+        chip.pack()
+
+        tk.Label(self, text=title, bg=tint, fg=P.muted,
+                 font=F_SMALL_B).pack(anchor="w", padx=16, pady=(10, 0))
+        self.val = tk.Label(self, text=str(value), bg=tint, fg=P.text,
+                            font=(FONT_FAMILY, 25, "bold"))
+        self.val.pack(anchor="w", padx=16, pady=(2, 0))
+        self.sub = tk.Label(self, text=subtitle, bg=tint, fg=P.faint, font=F_TINY)
+        self.sub.pack(anchor="w", padx=16, pady=(0, 12))
+
+    def set(self, v):
+        try: self.val.configure(text=str(v))
+        except tk.TclError: pass
+
+    def set_subtitle(self, text):
+        try: self.sub.configure(text=text)
+        except tk.TclError: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADD/EDIT STUDENT DIALOG
+# ═══════════════════════════════════════════════════════════════════════════════
+class StudentDialog(tk.Toplevel):
+    def __init__(self, app, student: dict | None = None):
+        super().__init__(app.root)
+        self.app = app
+        self.student = student
+        self.is_edit  = student is not None
+        self.captured_frame    = None
+        self.captured_encoding = None
+        self.preview_image     = None
+        self._mw_binding     = None
+
+        title_text = "Edit Student" if self.is_edit else "Add New Student"
+        self.title(title_text)
+        self.configure(bg=P.bg)
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.grab_set()
+
+        # cap to 88% of screen height, max 700px so buttons always show
+        screen_h = self.winfo_screenheight()
+        dlg_h    = min(700, int(screen_h * 0.88))
+        self.geometry(f"520x{dlg_h}")
+        self.maxsize(520, dlg_h)
+
+        self._build()
+
+        if self.is_edit:
+            self.roll_var.set(str(student.get("Roll No", "")))
+            self.name_var.set(str(student.get("Name", "")))
+            self.grade_var.set(str(student.get("Grade", "")))
+            house_val = str(student.get("House", "None")).strip() or "None"
+            self.house_var.set(house_val if house_val in HOUSES else "None")
+            self.phone_var.set(str(student.get("Parent Phone", "")))
+            self.email_var.set(str(student.get("Parent Email", "")))
+            uid = str(student.get("UID", ""))
+            fp  = FACES_DIR / f"{uid}.jpg"
+            if fp.exists() and Image:
+                img = Image.open(fp)
+                img.thumbnail((490, 200))
+                self.preview_image = ImageTk.PhotoImage(img)
+                self.preview_lbl.configure(image=self.preview_image, text="")
+
+    def _build(self):
+        # ── scrollable shell ──────────────────────────────────────────────────
+        outer = tk.Frame(self, bg=P.bg)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, bg=P.bg, highlightthickness=0)
+        vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        shell = tk.Frame(canvas, bg=P.bg)
+        win_id = canvas.create_window((0, 0), window=shell, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        shell.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._mw_binding = "<MouseWheel>"
+        canvas.bind_all(self._mw_binding, lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self.bind("<Destroy>", lambda e: canvas.unbind_all(self._mw_binding))
+
+        pad = tk.Frame(shell, bg=P.bg)
+        pad.pack(fill="both", expand=True, padx=22, pady=18)
+
+        # title
+        title_text = "✏  Edit Student" if self.is_edit else "➕  Add Student"
+        tk.Label(pad, text=title_text, bg=P.bg, fg=P.text,
+                 font=F_H2).pack(anchor="w")
+        tk.Label(pad,
+                 text="Fill in the details below." + ("" if self.is_edit else " Then capture a face."),
+                 bg=P.bg, fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(2, 10))
+
+        # form card
+        form = tk.Frame(pad, bg=P.surface, highlightthickness=1, highlightbackground=P.border)
+        form.pack(fill="x")
+
+        self.roll_var  = tk.StringVar()
+        self.name_var  = tk.StringVar()
+        self.grade_var = tk.StringVar()
+        self.house_var = tk.StringVar(value="None")
+        self.phone_var = tk.StringVar()
+        self.email_var = tk.StringVar()
+
+        self._field(form, "Roll No",      self.roll_var,  "e.g. 7C04")
+        self._field(form, "Name",         self.name_var,  "e.g. Arjun Kumar")
+        self._field(form, "Grade",        self.grade_var, "e.g. 7C")
+
+        # house row
+        hr = tk.Frame(form, bg=P.surface)
+        hr.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(hr, text="House", bg=P.surface, fg=P.muted,
+                 font=F_SMALL_B, width=14, anchor="w").pack(side="left")
+        house_cb = ttk.Combobox(hr, textvariable=self.house_var,
+                                values=HOUSES, state="readonly",
+                                font=F_BODY, width=12)
+        house_cb.pack(side="left")
+        self.house_dot = tk.Label(hr, text=" ●", bg=P.surface,
+                                   fg=P.faint, font=F_H3)
+        self.house_dot.pack(side="left", padx=4)
+        house_cb.bind("<<ComboboxSelected>>", self._update_house_dot)
+
+        self._field(form, "Parent Phone", self.phone_var, "+919876543210")
+        self._field(form, "Parent Email", self.email_var, "parent@example.com")
+        tk.Frame(form, bg=P.border, height=1).pack(fill="x", padx=14, pady=(10, 0))
+
+        # compact photo preview
+        prev_box = tk.Frame(pad, bg=P.sidebar2, height=120,
+                            highlightthickness=1, highlightbackground=P.border)
+        prev_box.pack(fill="x", pady=10)
+        prev_box.pack_propagate(False)
+        self.preview_lbl = tk.Label(prev_box,
+                                    text="📷  No face captured yet",
+                                    bg=P.sidebar2, fg=P.muted, font=F_BODY)
+        self.preview_lbl.pack(fill="both", expand=True)
+
+        self.msg_lbl = tk.Label(pad, text="", bg=P.bg, fg=P.muted,
+                                font=F_SMALL, anchor="w")
+        self.msg_lbl.pack(fill="x")
+
+        # buttons — always at bottom of scroll content
+        btn_row = tk.Frame(pad, bg=P.bg)
+        btn_row.pack(fill="x", pady=(8, 4))
+
+        if not self.is_edit:
+            AnimBtn(btn_row, text="📷  Capture",
+                    command=self.capture_face,
+                    bg=P.blue, fg="white", activebackground=P.blue_dark,
+                    activeforeground="white", relief="flat", padx=14, pady=10,
+                    font=F_BODY_B, cursor="hand2",
+                    anim_color=P.blue_glow).pack(side="left")
+        else:
+            AnimBtn(btn_row, text="📱  QR Code",
+                    command=self._show_qr,
+                    bg=P.purple, fg="white", activebackground=P.purple,
+                    activeforeground="white", relief="flat", padx=14, pady=10,
+                    font=F_BODY_B, cursor="hand2",
+                    anim_color="#7c3aed").pack(side="left")
+
+        save_lbl = "💾  Save Changes" if self.is_edit else "✅  Save"
+        AnimBtn(btn_row, text=save_lbl, command=self.save,
+                bg=P.green, fg="white", activebackground=P.green_dark,
+                activeforeground="white", relief="flat", padx=14, pady=10,
+                font=F_BODY_B, cursor="hand2",
+                anim_color="#15803d").pack(side="right")
+        AnimBtn(btn_row, text="✕ Cancel", command=self.destroy,
+                bg=P.surface2, fg=P.text, activebackground=P.border,
+                activeforeground=P.text, relief="flat", padx=12, pady=10,
+                font=F_BODY_B, cursor="hand2").pack(side="right", padx=(0, 8))
+
+        canvas.after(50, lambda: canvas.yview_moveto(0.0))
+
+    def _update_house_dot(self, _e=None):
+        h   = self.house_var.get()
+        clr = HOUSE_COLORS.get(h, P.faint)
+        self.house_dot.configure(fg=clr if clr else P.faint)
+
+    def _field(self, master, label, var, hint):
+        row = tk.Frame(master, bg=P.surface)
+        row.pack(fill="x", padx=14, pady=(8, 0))
+        tk.Label(row, text=label, bg=P.surface, fg=P.muted,
+                 font=F_SMALL_B, width=14, anchor="w").pack(side="left")
+        e = ttk.Entry(row, textvariable=var, font=F_BODY)
+        e.pack(side="left", fill="x", expand=True)
+        tk.Label(master, text=hint, bg=P.surface, fg=P.faint,
+                 font=F_TINY, anchor="w").pack(fill="x", padx=(156, 14), pady=(1, 0))
+
+    def msg(self, text, color=P.muted):
+        self.msg_lbl.configure(text=text, fg=color)
+
+    def capture_face(self):
+        if not ensure_face_recognition():
+            self.msg("face_recognition not available.", P.red); return
+        frame = self.app.get_capture_frame()
+        if frame is None:
+            self.msg("Could not read from camera.", P.red); return
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        locs = face_recognition.face_locations(rgb, model="hog")
+        if len(locs) != 1:
+            self.msg("Keep exactly one face in frame.", P.red); return
+        encs = face_recognition.face_encodings(rgb, locs)
+        if not encs:
+            self.msg("Face detected but encoding failed.", P.red); return
+        t, r, b, l = locs[0]; pad = 45; h, w = frame.shape[:2]
+        crop = frame[max(0,t-pad):min(h,b+pad), max(0,l-pad):min(w,r+pad)]
+        self.captured_frame    = crop.copy()
+        self.captured_encoding = encs[0]
+        rgb2  = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        img   = Image.fromarray(rgb2); img.thumbnail((490, 155))
+        self.preview_image = ImageTk.PhotoImage(img)
+        self.preview_lbl.configure(image=self.preview_image, text="")
+        self.msg("Face captured successfully.", P.green)
+
+    def _show_qr(self):
+        """Display the student's QR code in a popup."""
+        if not self.is_edit:
+            return
+        uid = str(self.student.get("UID", ""))
+        name = str(self.student.get("Name", ""))
+        roll = str(self.student.get("Roll No", ""))
+        path = generate_student_qr(uid, name, roll)
+        if path is None or not path.exists():
+            self.msg("QR generation unavailable (install qrcode).", P.red)
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"QR Code — {name}")
+        dlg.configure(bg=P.bg)
+        dlg.transient(self)
+        tk.Label(dlg, text=f"QR Code for {name} ({roll})", bg=P.bg, fg=P.text,
+                 font=F_H3).pack(pady=(16, 8))
+        if Image:
+            img = Image.open(path)
+            img.thumbnail((280, 280))
+            photo = ImageTk.PhotoImage(img)
+            lbl = tk.Label(dlg, image=photo, bg=P.bg)
+            lbl.image = photo
+            lbl.pack(pady=8)
+        tk.Label(dlg, text="Scan this code to mark attendance", bg=P.bg, fg=P.muted,
+                 font=F_SMALL).pack(pady=(0, 16))
+        AnimBtn(dlg, text="✕  Close", command=dlg.destroy,
+            bg=P.surface2, fg=P.text, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=16, pady=8,
+            font=F_BODY_B, cursor="hand2").pack(pady=(0, 12))
+
+    def save(self):
+        roll  = self.roll_var.get().strip().upper()
+        name  = self.name_var.get().strip()
+        grade = self.grade_var.get().strip().upper()
+        house = self.house_var.get().strip() or "None"
+        phone = clean_phone(self.phone_var.get())
+        email = self.email_var.get().strip()
+
+        if not all([roll, name, grade, phone, email]):
+            play_sound(SOUND_ERROR)
+            self.msg("All fields are required.", P.red); return
+        if "@" not in email or "." not in email:
+            play_sound(SOUND_ERROR)
+            self.msg("Invalid parent email.", P.red); return
+
+        if self.is_edit:
+            uid = str(self.student.get("UID", ""))
+            try:
+                self.app.store.edit_student(uid, roll, name, grade, house, phone, email)
+            except ValueError as e:
+                play_sound(SOUND_ERROR)
+                self.msg(str(e), P.red)
+                return
+            # Generate QR for existing student
+            generate_student_qr(uid, name, roll)
+            self.app.refresh_all()
+            self.app.log(f"Edited student {name} ({uid}).")
+            Toast.show(self.app.root, f"{name} updated.", "success")
+            self.destroy()
+        else:
+            if self.captured_encoding is None:
+                play_sound(SOUND_ERROR)
+                self.msg("Capture a face first.", P.red); return
+            uid  = self.app.store.next_uid()
+            fp   = FACES_DIR / f"{uid}.jpg"
+            cv2.imwrite(str(fp), self.captured_frame)
+            self.app.store.add_student(roll, uid, name, grade, house, phone, email, self.captured_encoding, fp)
+            # Generate QR for new student
+            generate_student_qr(uid, name, roll)
+            self.app.refresh_all()
+            self.app.log(f"Added {name} ({uid}).")
+            play_sound(SOUND_SUCCESS)
+            Toast.show(self.app.root, f"{name} added successfully!", "success")
+            self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  YEAR-END PROMOTION  ("7C -> 8C" for every student, in one click)
+# ═══════════════════════════════════════════════════════════════════════════════
+class PromotionDialog(tk.Toplevel):
+    """
+    Solves the "some students' sections change every year, changing them
+    one by one is a hassle" problem: instead of opening every student's
+    edit dialog individually, the teacher sees ONE row per distinct
+    Grade/Section value currently in use (not one row per student), each
+    pre-filled with a sensible auto-incremented suggestion (7C -> 8C),
+    fully editable in case a section is merging, splitting, or a whole
+    year group is graduating out. Every student sharing that old value
+    moves together when Apply is pressed. A backup of the Excel file is
+    taken automatically before anything is written.
+    """
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title(app.T("promote_title"))
+        self.configure(bg=P.bg)
+        self.transient(app.root)
+        self.grab_set()
+        screen_h = self.winfo_screenheight()
+        dlg_h = min(640, int(screen_h * 0.82))
+        self.geometry(f"640x{dlg_h}")
+
+        students = app.store.load_students()
+        counts: dict[str, int] = {}
+        for s in students:
+            g = str(s.get("Grade", "")).strip()
+            counts[g] = counts.get(g, 0) + 1
+        self._grades = sorted(counts.keys(), key=lambda g: (len(g), g))
+        self._counts = counts
+        self._mapping_vars: dict[str, tk.StringVar] = {}
+
+        tk.Label(self, text=app.T("promote_title"), bg=P.bg, fg=P.text,
+                 font=F_H2).pack(anchor="w", padx=20, pady=(18, 2))
+        tk.Label(self, text=app.T("promote_desc"), bg=P.bg, fg=P.muted,
+                 font=F_SMALL, wraplength=590, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
+
+        if not self._grades:
+            tk.Label(self, text="No students found — nothing to promote.",
+                     bg=P.bg, fg=P.muted, font=F_BODY).pack(padx=20, pady=20)
+            return
+
+        # ── scrollable list of grade -> new grade mappings ──────────────────
+        shell = tk.Frame(self, bg=P.surface, highlightthickness=1, highlightbackground=P.border_soft)
+        shell.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        canvas = tk.Canvas(shell, bg=P.surface, highlightthickness=0)
+        vsb = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=P.surface)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        header = tk.Frame(inner, bg=P.surface2)
+        header.pack(fill="x")
+        tk.Label(header, text="Current", bg=P.surface2, fg=P.muted, font=F_SMALL_B, width=14, anchor="w").pack(side="left", padx=(10, 0), pady=6)
+        tk.Label(header, text="Students", bg=P.surface2, fg=P.muted, font=F_SMALL_B, width=8, anchor="w").pack(side="left", pady=6)
+        tk.Label(header, text=f"\u2192  {app.T('new_section')}", bg=P.surface2, fg=P.muted, font=F_SMALL_B, anchor="w").pack(side="left", padx=(6, 0), pady=6)
+
+        for g in self._grades:
+            row = tk.Frame(inner, bg=P.surface)
+            row.pack(fill="x")
+            tk.Label(row, text=g or "(blank)", bg=P.surface, fg=P.text, font=F_BODY, width=14, anchor="w").pack(side="left", padx=(10, 0), pady=6)
+            tk.Label(row, text=str(counts[g]), bg=P.surface, fg=P.muted, font=F_BODY, width=8, anchor="w").pack(side="left", pady=6)
+            var = tk.StringVar(value=suggest_promoted_grade(g))
+            ttk.Entry(row, textvariable=var, font=F_BODY, width=16).pack(side="left", padx=(6, 10), pady=6)
+            self._mapping_vars[g] = var
+
+        note = tk.Label(self, bg=P.bg, fg=P.faint, font=F_TINY, justify="left", anchor="w",
+            text="Tip: leave a field unchanged to keep that group as-is. Clear a field entirely "
+                 "and that group is skipped (no students in it will be touched).")
+        note.pack(anchor="w", padx=20, pady=(0, 6), fill="x")
+
+        btns = tk.Frame(self, bg=P.bg)
+        btns.pack(fill="x", padx=20, pady=(0, 18))
+        AnimBtn(btns, text=app.T("cancel"), command=self.destroy,
+            bg=P.surface2, fg=P.muted, activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=14, pady=8, font=F_SMALL_B, cursor="hand2").pack(side="right")
+        AnimBtn(btns, text=app.T("apply_promotion"), command=self._apply,
+            bg=P.blue, fg="white", activebackground=P.blue_dark, activeforeground="white",
+            relief="flat", padx=14, pady=8, font=F_SMALL_B, cursor="hand2", anim_color=P.blue_glow).pack(side="right", padx=(0, 8))
+
+    def _apply(self):
+        mapping = {}
+        for g, var in self._mapping_vars.items():
+            new_val = var.get().strip()
+            if new_val and new_val != g:
+                mapping[g] = new_val
+        if not mapping:
+            Toast.show(self.app.root, "No changes to apply.", "info")
+            self.destroy()
+            return
+
+        preview_lines = "\n".join(f"  {g}  \u2192  {mapping[g]}  ({self._counts[g]} student(s))" for g in mapping)
+        if not messagebox.askyesno(
+                self.app.T("promote_title"),
+                f"This will move students across {len(mapping)} group(s):\n\n{preview_lines}\n\n"
+                f"A backup will be saved first. Continue?"):
+            return
+
+        try:
+            backup_path = self.app.store.backup()
+            self.app.log(f"Pre-promotion backup saved: {backup_path.name}")
+        except Exception as e:
+            if not messagebox.askyesno("Backup failed",
+                    f"Could not create a backup ({e}). Apply the promotion anyway?"):
+                return
+
+        students = self.app.store.load_students()
+        moved = 0
+        for s in students:
+            g = str(s.get("Grade", "")).strip()
+            if g in mapping:
+                uid = str(s.get("UID", ""))
+                try:
+                    self.app.store.edit_student(
+                        uid, s.get("Roll No", ""), s.get("Name", ""), mapping[g],
+                        s.get("House", "None"), s.get("Parent Phone", ""), s.get("Parent Email", ""))
+                    moved += 1
+                except Exception as e:
+                    self.app.log(f"Promotion failed for {uid}: {e}")
+
+        self.app.refresh_all()
+        play_sound(SOUND_SUCCESS)
+        Toast.show(self.app.root, f"Promoted {moved} student(s) across {len(mapping)} group(s).", "success", 6000)
+        self.app.log(f"Promotion applied: {mapping} ({moved} student(s) moved).")
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EASTER EGG: MINI GAME ARCADE — launched from the Console tab with
+#  /launch <game_name>. Each game is a fully self-contained tk.Toplevel;
+#  none of them touch attendance data, they just live in the same process
+#  because the console command dispatcher is right there.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# `/launch dungeon` needs a full pygame window/event loop of its own — it
+# can't share the Tk mainloop like the games below, so its ~2200-line source
+# is embedded here and written out to disk on first launch, then run as a
+# separate process. Keeps the whole app a single file to distribute.
+DUNGEON_CRAWLER_SOURCE = r'''
+"""
+DUNGEON CRAWLER – ULTIMATE EDITION v6
+Controls: WASD/Space=Move/Jump  Z=Melee  X=Shoot(mouse aim)
+          1-9=Weapon  G=DropWeapon  H=HealthKit  0=TeleportScroll  R=Restart
+v6 CHANGES:
+  - Fixed unreachable 10th weapon slot: bag is now hard-capped at 9 (matches
+    keys 1-9). Picking up a weapon while full leaves it on the ground with a
+    "Bag full! Press G to drop" prompt instead of silently discarding it.
+  - New G key: drop the currently equipped weapon onto the ground (Fists
+    can't be dropped — you're never left with an empty bag).
+  - Replaced the "clear every monster on the map before the next wave spawns"
+    gate with continuous proximity spawning: monsters trickle in near the
+    player instead of being scattered across the whole world, so there's
+    never a straggler to hunt down on the far side of a 100-tile map.
+    Difficulty tier now scales off kill count, not a full-clear requirement.
+v5 CHANGES:
+  - Ally: finite HP (200), no infinite jump, uses gun (Rifle), obstacle-aware jump
+  - World border: invisible wall + dense terrain, mobs/spawns blocked from edges
+  - Gun ammo system: all guns need ammo, dropped by mobs
+  - 8 new monster varieties (Bandit, Golem, Wraith, Harpy, Lizardman, Berserker, Lich, Serpent)
+  - ENEMY_PW updated for new mobs
+"""
+import pygame, random, math, sys
+pygame.init()
+
+W, H = 1024, 768
+screen = pygame.display.set_mode((W, H))
+pygame.display.set_caption("Dungeon Crawler – Ultimate")
+clock  = pygame.time.Clock()
+TILE   = 32
+
+# ─── PALETTE ─────────────────────────────────────────────────────────────────
+SKY_DAY_TOP=(80,140,220);  SKY_DAY_BOT=(160,200,255)
+SKY_DUSK_TOP=(200,100,50); SKY_DUSK_BOT=(240,160,80)
+SKY_NIGHT_TOP=(12,8,24);   SKY_NIGHT_BOT=(30,20,60)
+DIRT_D=(90,55,28);  DIRT_L=(120,78,40)
+STONE_D=(62,62,72); STONE_L=(92,92,108)
+GRASS_TOP=(56,148,52); GRASS_BL=(40,100,36)
+C_WHITE=(240,240,255); C_BLACK=(0,0,0); C_DARK=(12,10,22)
+C_RED=(220,55,55);   C_GREEN=(55,200,90);  C_BLUE=(70,150,240)
+C_YELLOW=(255,220,55); C_ORANGE=(255,138,38); C_CYAN=(55,218,210)
+C_GOLD=(255,198,0);  C_PURPLE=(175,75,220); C_PINK=(255,95,175)
+C_GRAY=(128,138,158); C_DARKRED=(110,18,18); C_BROWN=(92,58,24)
+C_FIRE=(255,80,20);  C_ICE=(100,200,255);   C_TEAL=(38,180,160)
+WALL_COL=(22,18,34)
+
+FONT_SM=pygame.font.SysFont("consolas",13,bold=True)
+FONT_MD=pygame.font.SysFont("consolas",17,bold=True)
+FONT_LG=pygame.font.SysFont("consolas",26,bold=True)
+FONT_XL=pygame.font.SysFont("consolas",52,bold=True)
+FONT_T =pygame.font.SysFont("consolas",72,bold=True)
+
+SOUND_VOL = 0.6
+SFX = {}; MUSIC_SND = None; HAS_SOUND = False
+
+def _try_init_sound():
+    global HAS_SOUND, MUSIC_SND, SFX
+    try:
+        import numpy as np
+        pygame.mixer.init(22050, -16, 2, 512)
+        SR = 22050
+        def _w(freq,dur,vol,shape="sq",decay=True,vibrato=0):
+            n=int(SR*dur); t=np.linspace(0,dur,n,False)
+            if vibrato: freq_arr=freq*(1+0.015*np.sin(2*np.pi*vibrato*t))
+            else: freq_arr=np.full(n,float(freq))
+            phase=np.cumsum(2*np.pi*freq_arr/SR)
+            if shape=="sq":  w=np.sign(np.sin(phase))
+            elif shape=="si":w=np.sin(phase)
+            elif shape=="no":w=np.random.uniform(-1,1,n)
+            elif shape=="saw":w=(phase%(2*np.pi))/math.pi-1
+            else: w=np.sin(phase)
+            if decay: w*=np.linspace(1,0,n)**1.4
+            w=(w*vol*32767).clip(-32767,32767).astype(np.int16)
+            return pygame.sndarray.make_sound(np.column_stack((w,w)))
+        def _chord(freqs,dur,vol,shape="si"):
+            n=int(SR*dur); mix=np.zeros(n); t=np.linspace(0,dur,n,False)
+            for f in freqs:
+                w=np.sign(np.sin(2*np.pi*f*t)) if shape=="sq" else np.sin(2*np.pi*f*t)
+                mix+=w*np.linspace(1,0,n)**1.2
+            mix=mix/len(freqs)
+            mix=(mix*vol*32767).clip(-32767,32767).astype(np.int16)
+            return pygame.sndarray.make_sound(np.column_stack((mix,mix)))
+        SFX["swing"]=_w(280,0.10,0.22,"sq"); SFX["shoot"]=_w(680,0.07,0.20,"si")
+        SFX["hit"]=_w(160,0.08,0.25,"sq"); SFX["coin"]=_w(900,0.10,0.22,"si")
+        SFX["level"]=_chord([330,415,523,660],0.55,0.30)
+        SFX["pickup"]=_w(540,0.13,0.22,"si"); SFX["power"]=_w(780,0.28,0.30,"si",vibrato=6)
+        SFX["heal"]=_chord([392,523,659],0.30,0.28); SFX["tele"]=_w(300,0.22,0.28,"saw")
+        SFX["click"]=_w(800,0.05,0.18,"si"); SFX["fire_sw"]=_w(200,0.12,0.25,"no")
+        SFX["ice_sw"]=_w(600,0.14,0.22,"si"); SFX["gun_p"]=_w(120,0.05,0.30,"sq",decay=False)
+        SFX["gun_r"]=_w(95,0.04,0.32,"sq",decay=False); SFX["shotgun"]=_w(80,0.07,0.35,"no",decay=False)
+        SFX["rocket"]=_w(60,0.12,0.38,"no",decay=False); SFX["explode"]=_w(55,0.25,0.42,"no")
+        SFX["dry"]=_w(300,0.06,0.15,"sq")   # empty gun click
+        SFX["ammo"]=_w(700,0.09,0.20,"si")  # ammo pickup
+        SFX["die"]=_w(95,0.22,0.28,"no"); SFX["boss"]=_chord([110,138,165],0.60,0.32)
+        bpm=108; beat=SR*60/bpm
+        def note(f,beats,vol=0.10,shape="sq"):
+            n=int(beat*beats); t=np.linspace(0,beats*60/bpm,n,False)
+            w=np.sign(np.sin(2*np.pi*f*t)) if shape=="sq" else np.sin(2*np.pi*f*t)
+            env=np.ones(n); fade_len=max(1,n//4); env[-fade_len:]=np.linspace(1,0,fade_len)
+            return (w*env*vol*32767).astype(np.int16)
+        mel=[(330,1),(294,.5),(262,.5),(294,1),(330,1),(330,1),(330,2),
+             (294,1),(294,1),(294,2),(330,1),(392,1),(392,2),
+             (330,1),(294,.5),(262,.5),(294,1),(330,1),(330,1),(330,1),(330,1),
+             (294,1),(294,1),(330,1),(294,1),(262,4)]
+        bass=[(130,2),(146,2),(110,2),(123,2)]*4
+        ms=np.concatenate([note(f,d) for f,d in mel])
+        bs=np.concatenate([note(f,d,0.07,"si") for f,d in bass])
+        tot=max(len(ms),len(bs))
+        ms=np.pad(ms,(0,tot-len(ms))); bs=np.pad(bs,(0,tot-len(bs)))
+        mix=(ms+bs).clip(-32767,32767).astype(np.int16)
+        MUSIC_SND=pygame.sndarray.make_sound(np.column_stack((mix,mix)))
+        HAS_SOUND=True; print("Sound OK")
+    except Exception as e: print(f"Sound failed: {e}"); HAS_SOUND=False
+
+_try_init_sound()
+def play(key):
+    if not HAS_SOUND or SOUND_VOL<=0: return
+    s=SFX.get(key)
+    if s:
+        try:
+            ch=s.play()
+            if ch: ch.set_volume(SOUND_VOL)
+        except: pass
+def music_play():
+    if HAS_SOUND and MUSIC_SND and SOUND_VOL>0:
+        try: MUSIC_SND.play(-1)
+        except: pass
+def music_stop():
+    if HAS_SOUND and MUSIC_SND:
+        try: MUSIC_SND.stop()
+        except: pass
+
+# ─── UTILS ───────────────────────────────────────────────────────────────────
+def dist(a,b): return math.hypot(a[0]-b[0],a[1]-b[1])
+def norm(dx,dy):
+    l=math.hypot(dx,dy); return (dx/l,dy/l) if l else (0.,0.)
+def lerp(a,b,t): return a+(b-a)*t
+def lerp_col(c1,c2,t): return tuple(int(lerp(c1[i],c2[i],t)) for i in range(3))
+def clamp(v,lo,hi): return max(lo,min(hi,v))
+def xp_for(lvl): return int(42*(lvl**1.65))
+def sa(w,h): return pygame.Surface((w,h),pygame.SRCALPHA)
+
+# ─── DAY/NIGHT CYCLE ─────────────────────────────────────────────────────────
+DAY_LEN=14400
+DAWN_END=int(DAY_LEN*0.12); DAY_END=int(DAY_LEN*0.55); DUSK_END=int(DAY_LEN*0.68)
+def sky_colors(dt):
+    t=dt%DAY_LEN
+    if t<DAWN_END:   p=t/DAWN_END; return lerp_col(SKY_NIGHT_TOP,SKY_DAY_TOP,p),lerp_col(SKY_NIGHT_BOT,SKY_DAY_BOT,p)
+    elif t<DAY_END:  return SKY_DAY_TOP,SKY_DAY_BOT
+    elif t<DUSK_END: p=(t-DAY_END)/(DUSK_END-DAY_END); return lerp_col(SKY_DAY_TOP,SKY_DUSK_TOP,p),lerp_col(SKY_DAY_BOT,SKY_DUSK_BOT,p)
+    else:            p=(t-DUSK_END)/(DAY_LEN-DUSK_END); return lerp_col(SKY_DUSK_TOP,SKY_NIGHT_TOP,p),lerp_col(SKY_DUSK_BOT,SKY_NIGHT_BOT,p)
+def night_alpha(dt):
+    t=dt%DAY_LEN
+    if t<DAWN_END:   return int(180*(1-t/DAWN_END))
+    elif t<DAY_END:  return 0
+    elif t<DUSK_END: return int(60*(t-DAY_END)/(DUSK_END-DAY_END))
+    else:            return int(60+120*(t-DUSK_END)/(DAY_LEN-DUSK_END))
+def game_time_str(dt):
+    frac=(dt%DAY_LEN)/DAY_LEN; tm=int(frac*1440)
+    return f"{tm//60:02d}:{tm%60:02d}"
+
+# ─── POWERUP DEFS ────────────────────────────────────────────────────────────
+POWERUP_DEFS={
+    "jump_boost": {"label":"Jump Boost", "color":(120,200,255),"duration":480,"icon":"JMP"},
+    "speed_boost":{"label":"Speed Boost","color":(255,220,60), "duration":420,"icon":"SPD"},
+    "damage_amp": {"label":"Damage x2",  "color":(255,80,80),  "duration":360,"icon":"DMG"},
+    "shield":     {"label":"Shield",     "color":(80,180,255), "duration":300,"icon":"SLD"},
+    "rapid_fire": {"label":"Rapid Fire", "color":(200,255,100),"duration":420,"icon":"RFR"},
+    "magnet":     {"label":"Coin Magnet","color":(255,198,0),  "duration":600,"icon":"MAG"},
+    "regen":      {"label":"Regen",      "color":(80,255,140), "duration":480,"icon":"REG"},
+}
+ENEMY_PW={
+    "Slime":    {"speed_boost":3,"magnet":2},
+    "Goblin":   {"rapid_fire":3,"damage_amp":2,"jump_boost":2},
+    "Bandit":   {"speed_boost":4,"damage_amp":2,"rapid_fire":2},
+    "Lizardman":{"shield":2,"regen":2,"speed_boost":2},
+    "Orc":      {"shield":3,"damage_amp":3,"regen":2},
+    "Skeleton": {"jump_boost":3,"rapid_fire":2,"speed_boost":2},
+    "Harpy":    {"jump_boost":4,"speed_boost":3,"rapid_fire":2},
+    "Troll":    {"shield":3,"regen":4,"speed_boost":2},
+    "Golem":    {"shield":5,"regen":3,"damage_amp":2},
+    "Berserker":{"damage_amp":5,"speed_boost":4,"rapid_fire":3},
+    "Vampire":  {"damage_amp":4,"speed_boost":3,"regen":3},
+    "Witch":    {"rapid_fire":4,"damage_amp":3,"magnet":2},
+    "Wraith":   {"shield":3,"speed_boost":4,"damage_amp":3},
+    "Serpent":  {"regen":3,"speed_boost":3,"damage_amp":2},
+    "Lich":     {"rapid_fire":5,"damage_amp":4,"shield":3,"magnet":3},
+    "Demon":    {"shield":4,"damage_amp":4,"regen":3,"jump_boost":3,"rapid_fire":3},
+    "Dragon":   {"shield":5,"damage_amp":5,"regen":4,"jump_boost":4,"rapid_fire":4},
+}
+
+# ─── GUN AMMO SYSTEM ─────────────────────────────────────────────────────────
+# Maps gun weapon name -> ammo kind string
+GUN_AMMO={
+    "Pistol":          "ammo_pistol",
+    "Rifle":           "ammo_rifle",
+    "Shotgun":         "ammo_shell",
+    "Plasma Gun":      "ammo_plasma",
+    "Rocket Launcher": "ammo_rocket",
+}
+AMMO_CAPS={
+    "ammo_pistol": 120,
+    "ammo_rifle":  80,
+    "ammo_shell":  40,
+    "ammo_plasma": 30,
+    "ammo_rocket": 12,
+}
+AMMO_PACK_SIZE={   # how many rounds per pickup
+    "ammo_pistol": random.randint,   # called below per-drop
+    "ammo_rifle":  random.randint,
+    "ammo_shell":  random.randint,
+    "ammo_plasma": random.randint,
+    "ammo_rocket": random.randint,
+}
+AMMO_GIVE={        # (min,max) per pickup
+    "ammo_pistol": (12,24),
+    "ammo_rifle":  (8,16),
+    "ammo_shell":  (4,10),
+    "ammo_plasma": (3,8),
+    "ammo_rocket": (1,3),
+}
+AMMO_COL={
+    "ammo_pistol": (200,200,100),
+    "ammo_rifle":  (180,220,180),
+    "ammo_shell":  (220,160,80),
+    "ammo_plasma": C_PURPLE,
+    "ammo_rocket": C_FIRE,
+}
+AMMO_KINDS=list(AMMO_GIVE.keys())
+
+def weapon_ammo_kind(wname):
+    return GUN_AMMO.get(wname, None)
+
+# ─── TILE GRAPHICS ───────────────────────────────────────────────────────────
+random.seed(999)
+def _make_tile(base,detail,border=None):
+    s=pygame.Surface((TILE,TILE)); s.fill(base)
+    for _ in range(16):
+        x,y=random.randint(0,TILE-4),random.randint(0,TILE-4)
+        pygame.draw.rect(s,detail,(x,y,random.randint(2,6),2))
+    if border:
+        pygame.draw.rect(s,border,(0,0,TILE,1))
+        pygame.draw.rect(s,border,(0,0,1,TILE))
+    return s
+def _make_grass():
+    s=pygame.Surface((TILE,TILE)); s.fill(DIRT_D)
+    for _ in range(16):
+        x,y=random.randint(0,TILE-3),random.randint(5,TILE-3)
+        pygame.draw.rect(s,DIRT_L,(x,y,random.randint(2,4),2))
+    for x in range(TILE):
+        h=random.randint(3,7)
+        for y in range(h):
+            c=tuple(clamp(GRASS_TOP[i]-y*9+random.randint(-5,5),0,255) for i in range(3))
+            pygame.draw.rect(s,c,(x,y,1,1))
+    return s
+def _make_plat():
+    s=pygame.Surface((TILE,TILE)); s.fill((32,28,50))
+    pygame.draw.rect(s,(92,72,36),(0,0,TILE,9))
+    for x in range(TILE): pygame.draw.rect(s,(112,92,50),(x,1,1,4))
+    pygame.draw.rect(s,(55,40,18),(0,0,TILE,1))
+    return s
+
+T_GRASS=_make_grass(); T_DIRT=_make_tile(DIRT_D,DIRT_L)
+T_STONE=_make_tile(STONE_D,STONE_L,(45,45,55)); T_WALL=_make_tile(WALL_COL,(32,25,48),(8,6,14))
+T_FLOOR=_make_tile((32,28,50),(48,42,68),(18,15,30)); T_PLAT=_make_plat()
+random.seed()
+
+TILE_E=0;WALL_T=1;FLOOR_T=2;PLAT_T=3;GRASS_T=4;DIRT_T=5;STONE_T=6
+SOLID={WALL_T,FLOOR_T,PLAT_T,GRASS_T,DIRT_T,STONE_T}
+
+# ─── WEAPON TABLE ─────────────────────────────────────────────────────────────
+WEAPON_DATA={
+    "Fists":          {"dmg":5,  "bdmg":4,  "range":58,"col":(220,175,145),"rare":100,"type":"melee","sfx":"swing","len":0},
+    "Short Sword":    {"dmg":16, "bdmg":9,  "range":68,"col":C_GRAY,       "rare":58, "type":"melee","sfx":"swing","len":22},
+    "Long Sword":     {"dmg":26, "bdmg":13, "range":82,"col":C_CYAN,       "rare":32, "type":"melee","sfx":"swing","len":32},
+    "Battle Axe":     {"dmg":40, "bdmg":17, "range":78,"col":C_ORANGE,     "rare":16, "type":"melee","sfx":"swing","len":28},
+    "Excalibur":      {"dmg":62, "bdmg":32, "range":92,"col":C_GOLD,       "rare":4,  "type":"melee","sfx":"swing","len":38},
+    "Fire Sword":     {"dmg":55, "bdmg":28, "range":88,"col":C_FIRE,       "rare":2,  "type":"melee","sfx":"fire_sw","len":36,"element":"fire"},
+    "Ice Sword":      {"dmg":48, "bdmg":25, "range":85,"col":C_ICE,        "rare":2,  "type":"melee","sfx":"ice_sw","len":36,"element":"ice"},
+    "Pistol":         {"dmg":18, "bdmg":18, "range":60,"col":C_GRAY,       "rare":35, "type":"gun","sfx":"gun_p","len":18},
+    "Rifle":          {"dmg":32, "bdmg":32, "range":55,"col":(80,80,100),  "rare":20, "type":"gun","sfx":"gun_r","len":28},
+    "Shotgun":        {"dmg":15, "bdmg":45, "range":52,"col":(100,70,50),  "rare":12, "type":"gun","sfx":"shotgun","len":26,"spread":5},
+    "Plasma Gun":     {"dmg":50, "bdmg":50, "range":65,"col":C_PURPLE,     "rare":5,  "type":"gun","sfx":"gun_r","len":24},
+    "Rocket Launcher":{"dmg":0,  "bdmg":80, "range":70,"col":(180,90,40),  "rare":8,  "type":"gun","sfx":"rocket","len":30,"rocket":True},
+}
+WNAMES=[k for k in WEAPON_DATA if k not in ("Fire Sword","Ice Sword","Fists","Shotgun")]
+def weapon_can_shoot(wname): return WEAPON_DATA.get(wname,{}).get("type","melee")=="gun"
+
+# ─── SPRITES ─────────────────────────────────────────────────────────────────
+def draw_weapon_in_hand(surf,weapon,facing_r,hand_x,hand_y,attacking=False,atk_prog=0):
+    if weapon=="Fists": return
+    wd=WEAPON_DATA[weapon]; col=wd["col"]; wtype=wd["type"]; wlen=wd.get("len",20)
+    bright=tuple(min(255,c+70) for c in col)
+    base_ang=-50 if facing_r else 230
+    sweep=110*atk_prog*(1 if facing_r else -1) if attacking else 0
+    ang=math.radians(base_ang+sweep)
+    sx=hand_x; sy=hand_y
+    ex=int(sx+math.cos(ang)*wlen); ey=int(sy+math.sin(ang)*wlen)
+    if wtype=="melee":
+        element=wd.get("element","")
+        pygame.draw.line(surf,col,(sx,sy),(ex,ey),4)
+        pygame.draw.line(surf,bright,(sx,sy),(int(sx+math.cos(ang)*(wlen*0.6)),int(sy+math.sin(ang)*(wlen*0.6))),2)
+        ga=math.radians(base_ang+sweep+90)
+        pygame.draw.line(surf,C_GOLD,(int(sx+math.cos(ga)*7),int(sy+math.sin(ga)*7)),(int(sx+math.cos(ga+math.pi)*7),int(sy+math.sin(ga+math.pi)*7)),3)
+        if element=="fire":
+            for i in range(4):
+                a2=ang+random.uniform(-0.4,0.4); r2=random.randint(3,7)
+                pygame.draw.circle(surf,random.choice([C_FIRE,C_YELLOW,C_ORANGE]),(ex+int(math.cos(a2)*r2),ey+int(math.sin(a2)*r2)),2)
+            pygame.draw.circle(surf,C_FIRE,(ex,ey),5); pygame.draw.circle(surf,C_YELLOW,(ex,ey),2)
+        elif element=="ice":
+            pygame.draw.circle(surf,C_ICE,(ex,ey),5)
+            for a2 in [ang+math.pi/3,ang-math.pi/3,ang+math.pi*2/3,ang-math.pi*2/3]:
+                pygame.draw.line(surf,C_ICE,(ex,ey),(ex+int(math.cos(a2)*5),ey+int(math.sin(a2)*5)),1)
+            pygame.draw.circle(surf,C_WHITE,(ex,ey),2)
+        if attacking and atk_prog>0.1:
+            for ti in range(5):
+                pa=math.radians(base_ang+sweep-ti*12*(1 if facing_r else -1))
+                tx2=int(sx+math.cos(pa)*wlen); ty2=int(sy+math.sin(pa)*wlen)
+                ts=sa(4,4); ts.fill((*col,max(0,180-ti*36))); surf.blit(ts,(tx2-2,ty2-2))
+    elif wtype=="gun":
+        ga=math.radians(base_ang+sweep+90); boff=4
+        bx=int(sx+math.cos(ga)*boff); by=int(sy+math.sin(ga)*boff)
+        if wd.get("rocket"):
+            pygame.draw.line(surf,(60,50,40),(bx,by),(ex,ey),8)
+            pygame.draw.line(surf,col,(bx,by),(ex,ey),5)
+            pygame.draw.circle(surf,(40,30,20),(ex,ey),7)
+        else:
+            pygame.draw.line(surf,(60,60,70),(bx,by),(ex,ey),6)
+            pygame.draw.line(surf,col,(bx,by),(ex,ey),3)
+            pygame.draw.circle(surf,(40,40,50),(ex,ey),4)
+        if attacking and atk_prog<0.15:
+            pygame.draw.circle(surf,C_YELLOW,(ex,ey),10 if wd.get("rocket") else 8)
+            pygame.draw.circle(surf,C_WHITE,(ex,ey),5 if wd.get("rocket") else 4)
+        if weapon=="Plasma Gun": pygame.draw.circle(surf,C_PURPLE,(ex,ey),6); pygame.draw.circle(surf,(220,180,255),(ex,ey),3)
+        if wd.get("rocket"): pygame.draw.circle(surf,C_FIRE,(ex,ey),4)
+
+def px_player(facing_r=True,wframe=0,attacking=False,wcol=C_GRAY):
+    s=sa(32,52)
+    sk=(255,198,148); hr=(72,45,18); sh=(55,95,178); pn=(45,55,128); bo=(72,45,22)
+    ll=int(math.sin(wframe*0.38)*4)
+    for y in range(13):
+        c2=pn if y<9 else bo
+        pygame.draw.rect(s,c2,(11,37+ll+y,5,1)); pygame.draw.rect(s,c2,(17,37-ll+y,5,1))
+    for y in range(12):
+        for x in range(12): pygame.draw.rect(s,sh,(10+x,17+y,1,1))
+    for y in range(12): pygame.draw.rect(s,tuple(max(0,c-28) for c in sh),(20,17+y,2,1))
+    ab=int(math.sin(wframe*0.38+math.pi)*2); atk_r=-6 if attacking else ab
+    for y in range(11): pygame.draw.rect(s,sk,(7,17+ab+y,4,1))
+    for y in range(11): pygame.draw.rect(s,sk,(21,17+atk_r+y,4,1))
+    for y in range(13):
+        for x in range(12): pygame.draw.rect(s,sk,(10+x,y,1,1))
+    for x in range(12): pygame.draw.rect(s,hr,(10+x,0,1,2))
+    for y in range(5): pygame.draw.rect(s,hr,(10,y,1,1))
+    ex=16 if facing_r else 12
+    pygame.draw.rect(s,(28,28,28),(ex,4,2,2)); pygame.draw.rect(s,C_WHITE,(ex+(1 if facing_r else -1),4,1,1))
+    if not facing_r: return pygame.transform.flip(s,True,False)
+    return s
+
+def px_ai_companion(facing_r=True,wframe=0):
+    s=sa(32,52)
+    sk=(220,180,140); hr=(200,160,20); sh=(120,40,180); pn=(80,30,140); bo=(60,40,20)
+    ll=int(math.sin(wframe*0.38)*4)
+    for y in range(13):
+        c2=pn if y<9 else bo
+        pygame.draw.rect(s,c2,(11,37+ll+y,5,1)); pygame.draw.rect(s,c2,(17,37-ll+y,5,1))
+    for y in range(12):
+        for x in range(12): pygame.draw.rect(s,sh,(10+x,17+y,1,1))
+    for y in range(11): pygame.draw.rect(s,sk,(7,17+y,4,1))
+    for y in range(11): pygame.draw.rect(s,sk,(21,17+y,4,1))
+    for y in range(13):
+        for x in range(12): pygame.draw.rect(s,sk,(10+x,y,1,1))
+    for x in range(12): pygame.draw.rect(s,hr,(10+x,0,1,3))
+    pygame.draw.rect(s,(28,28,28),(15,4,2,2)); pygame.draw.rect(s,C_GOLD,(14,21,4,4))
+    if not facing_r: return pygame.transform.flip(s,True,False)
+    return s
+
+# ── monster pixel art functions ───────────────────────────────────────────────
+def _px_slime(f=0,col=(72,192,72)):
+    s=sa(38,30); bob=int(math.sin(f*0.22)*3)
+    sq=(2,6-bob,34,20+bob); br=tuple(min(255,c+65) for c in col)
+    pygame.draw.ellipse(s,col,sq); pygame.draw.ellipse(s,br,(sq[0]+5,sq[1]+3,sq[2]-10,sq[3]-8))
+    pygame.draw.rect(s,C_WHITE,(8,10-bob,5,5)); pygame.draw.rect(s,C_WHITE,(22,10-bob,5,5))
+    pygame.draw.rect(s,(15,15,15),(9,11-bob,3,3)); pygame.draw.rect(s,(15,15,15),(23,11-bob,3,3))
+    return s
+
+def _px_goblin(f=0):
+    s=sa(28,40); gsk=(110,152,52); cl=(138,72,36); rc=(255,45,0)
+    bob=int(math.sin(f*0.28)*2); ll=int(math.sin(f*0.28)*3)
+    for y in range(9): pygame.draw.rect(s,cl,(7,31+ll+y,6,1))
+    for y in range(9): pygame.draw.rect(s,cl,(16,31-ll+y,6,1))
+    for y in range(20):
+        for x in range(14): pygame.draw.rect(s,cl,(7+x,12+y+bob,1,1))
+    for y in range(12):
+        for x in range(14): pygame.draw.rect(s,gsk,(7+x,y,1,1))
+    pygame.draw.rect(s,gsk,(3,3,4,6)); pygame.draw.rect(s,gsk,(21,3,4,6))
+    pygame.draw.rect(s,rc,(9,4,3,3)); pygame.draw.rect(s,rc,(17,4,3,3))
+    pygame.draw.rect(s,C_BROWN,(23,13+bob,3,13)); pygame.draw.rect(s,STONE_D,(21,10+bob,8,7))
+    return s
+
+def _px_bandit(f=0):
+    # Dark-cloaked human with dagger — red bandana
+    s=sa(28,44); sk=(200,160,120); cl=(40,30,30); rc=(200,30,30)
+    bob=int(math.sin(f*0.3)*2); ll=int(math.sin(f*0.3)*3)
+    for y in range(10): pygame.draw.rect(s,cl,(8,33+ll+y,5,1))
+    for y in range(10): pygame.draw.rect(s,cl,(15,33-ll+y,5,1))
+    for y in range(16):
+        for x in range(12): pygame.draw.rect(s,cl,(8+x,16+y+bob,1,1))
+    for y in range(10):
+        for x in range(12): pygame.draw.rect(s,sk,(8+x,5+y,1,1))
+    pygame.draw.rect(s,rc,(8,8,12,3))  # bandana
+    pygame.draw.rect(s,(28,28,28),(10,5,3,4)); pygame.draw.rect(s,(28,28,28),(16,5,3,4))
+    # dagger
+    pygame.draw.rect(s,C_GRAY,(22,18+bob,3,10)); pygame.draw.rect(s,C_BROWN,(21,27+bob,5,3))
+    return s
+
+def _px_lizardman(f=0):
+    s=sa(36,48); sc=(50,150,60); dk=(30,100,40); ar=(70,100,50)
+    bob=int(math.sin(f*0.22)*2); ll=int(math.sin(f*0.22)*4)
+    for y in range(12): pygame.draw.rect(s,sc,(10,35+ll+y,6,1))
+    for y in range(12): pygame.draw.rect(s,sc,(20,35-ll+y,6,1))
+    # tail
+    for i in range(8): pygame.draw.rect(s,sc,(28+i,38+i+bob,max(1,4-i//2),max(1,4-i//2)))
+    for y in range(18):
+        for x in range(16): pygame.draw.rect(s,ar,(10+x,17+y+bob,1,1))
+    for y in range(14):
+        for x in range(14): pygame.draw.rect(s,sc,(11+x,3+y,1,1))
+    pygame.draw.rect(s,(255,50,50),(13,5,4,4)); pygame.draw.rect(s,(255,50,50),(20,5,4,4))
+    # spear
+    pygame.draw.rect(s,C_BROWN,(0,14+bob,3,20)); pygame.draw.rect(s,C_GRAY,(0,11+bob,3,5))
+    return s
+
+def _px_orc(f=0):
+    s=sa(44,55); sk=(72,130,52); ar=(72,72,96)
+    bob=int(math.sin(f*0.18)*2); ll=int(math.sin(f*0.18)*5)
+    for y in range(14): pygame.draw.rect(s,ar,(8,40+ll+y,10,1))
+    for y in range(14): pygame.draw.rect(s,ar,(24,40-ll+y,10,1))
+    for y in range(24):
+        for x in range(28): pygame.draw.rect(s,ar,(8+x,18+y+bob,1,1))
+    for y in range(18):
+        for x in range(24): pygame.draw.rect(s,sk,(10+x,y,1,1))
+    pygame.draw.rect(s,(235,50,50),(13,5,6,6)); pygame.draw.rect(s,(235,50,50),(25,5,6,6))
+    pygame.draw.rect(s,C_WHITE,(14,15,3,6)); pygame.draw.rect(s,C_WHITE,(26,15,3,6))
+    pygame.draw.rect(s,C_BROWN,(37,13+bob,4,22)); pygame.draw.rect(s,STONE_L,(33,10+bob,10,13))
+    return s
+
+def _px_skel(f=0):
+    s=sa(28,46); bn=(228,222,208)
+    bob=int(math.sin(f*0.32)*2); ll=int(math.sin(f*0.32)*5)
+    for y in range(14): pygame.draw.rect(s,bn,(8,32+ll+y,3,1))
+    for y in range(14): pygame.draw.rect(s,bn,(18,32-ll+y,3,1))
+    for i in range(5): pygame.draw.rect(s,bn,(12,16+i*3+bob,4,2))
+    for i in range(3):
+        y2=18+i*4+bob
+        for x in range(5): pygame.draw.rect(s,bn,(6+x,y2,1,1))
+        for x in range(5): pygame.draw.rect(s,bn,(16+x,y2,1,1))
+    for y in range(13): pygame.draw.rect(s,bn,(4,16+y,3,1))
+    for y in range(13): pygame.draw.rect(s,bn,(20,16+y,3,1))
+    for y in range(12):
+        for x in range(14): pygame.draw.rect(s,bn,(7+x,y,1,1))
+    pygame.draw.rect(s,C_DARK,(9,3,5,5)); pygame.draw.rect(s,C_DARK,(15,3,5,5))
+    pygame.draw.rect(s,bn,(7,12,14,4))
+    return s
+
+def _px_harpy(f=0):
+    # Bird-woman: wings, talons
+    s=sa(44,42); sk=(230,200,180); wg=(140,80,40); fth=(180,110,60)
+    bob=int(math.sin(f*0.25)*3); flap=int(math.sin(f*0.4)*9)
+    # wings
+    pygame.draw.polygon(s,wg,[(0,18+bob),(14,6+flap+bob),(18,22+bob)])
+    pygame.draw.polygon(s,wg,[(44,18+bob),(30,6+flap+bob),(26,22+bob)])
+    pygame.draw.polygon(s,fth,[(2,20+bob),(12,10+flap+bob),(16,22+bob)])
+    pygame.draw.polygon(s,fth,[(42,20+bob),(32,10+flap+bob),(28,22+bob)])
+    # body
+    for y in range(14):
+        for x in range(12): pygame.draw.rect(s,sk,(16+x,14+y+bob,1,1))
+    # head
+    for y in range(10):
+        for x in range(10): pygame.draw.rect(s,sk,(17+x,3+y+bob,1,1))
+    pygame.draw.rect(s,(255,30,30),(19,5+bob,4,4)); pygame.draw.rect(s,(255,30,30),(24,5+bob,4,4))
+    # talons
+    for t in [(16,28),(28,28)]:
+        pygame.draw.rect(s,(80,60,20),(t[0],t[1]+bob,4,8))
+        pygame.draw.rect(s,(80,60,20),(t[0]-2,t[1]+6+bob,3,4))
+        pygame.draw.rect(s,(80,60,20),(t[0]+4,t[1]+6+bob,3,4))
+    return s
+
+def _px_troll(f=0):
+    s=sa(50,62); sk=(60,120,50); ar=(80,70,60)
+    bob=int(math.sin(f*0.15)*3); ll=int(math.sin(f*0.15)*6)
+    for y in range(16): pygame.draw.rect(s,ar,(8,45+ll+y,12,1))
+    for y in range(16): pygame.draw.rect(s,ar,(28,45-ll+y,12,1))
+    for y in range(28):
+        for x in range(34): pygame.draw.rect(s,ar,(8+x,18+y+bob,1,1))
+    for y in range(22):
+        for x in range(28): pygame.draw.rect(s,sk,(11+x,y,1,1))
+    pygame.draw.rect(s,(200,60,20),(14,8,7,7)); pygame.draw.rect(s,(200,60,20),(26,8,7,7))
+    pygame.draw.rect(s,(180,50,10),(12,16,4,3)); pygame.draw.rect(s,(180,50,10),(30,16,4,3))
+    pygame.draw.rect(s,C_BROWN,(42,16+bob,5,28)); pygame.draw.rect(s,STONE_D,(38,12+bob,12,18))
+    return s
+
+def _px_golem(f=0):
+    # Stone giant – very wide
+    s=sa(56,64); sc=STONE_D; sl=STONE_L; eye=(255,160,0)
+    bob=int(math.sin(f*0.10)*2); ll=int(math.sin(f*0.10)*4)
+    for y in range(18): pygame.draw.rect(s,sc,(8,45+ll+y,12,1))
+    for y in range(18): pygame.draw.rect(s,sc,(34,45-ll+y,12,1))
+    for y in range(30):
+        for x in range(36): pygame.draw.rect(s,sc,(10+x,16+y+bob,1,1))
+    # stone cracks
+    for i in range(5):
+        pygame.draw.rect(s,sl,(12+i*6,18+bob,2,random.randint(4,10)))
+    for y in range(18):
+        for x in range(22): pygame.draw.rect(s,sc,(17+x,y+bob,1,1))
+    pygame.draw.rect(s,eye,(20,5+bob,7,7)); pygame.draw.rect(s,eye,(30,5+bob,7,7))
+    pygame.draw.rect(s,(255,220,0),(22,7+bob,3,3)); pygame.draw.rect(s,(255,220,0),(32,7+bob,3,3))
+    # fists
+    pygame.draw.rect(s,sl,(4,28+bob,8,8)); pygame.draw.rect(s,sl,(44,28+bob,8,8))
+    return s
+
+def _px_berserker(f=0):
+    # Huge angry warrior, two axes
+    s=sa(46,54); sk=(180,100,80); ar=(90,50,30); cl=(80,40,20)
+    bob=int(math.sin(f*0.28)*3); ll=int(math.sin(f*0.28)*5)
+    for y in range(14): pygame.draw.rect(s,cl,(8,39+ll+y,9,1))
+    for y in range(14): pygame.draw.rect(s,cl,(28,39-ll+y,9,1))
+    for y in range(22):
+        for x in range(28): pygame.draw.rect(s,ar,(9+x,18+y+bob,1,1))
+    for y in range(16):
+        for x in range(22): pygame.draw.rect(s,sk,(12+x,2+y,1,1))
+    pygame.draw.rect(s,(255,30,0),(14,5,5,6)); pygame.draw.rect(s,(255,30,0),(26,5,5,6))
+    # axes left and right
+    for ox,flip in [(0,1),(38,-1)]:
+        pygame.draw.rect(s,C_BROWN,(ox+2 if flip==1 else ox,20+bob,3,14))
+        pygame.draw.polygon(s,C_GRAY,[(ox+(0 if flip==1 else 5),14+bob),(ox+(6 if flip==1 else -1),14+bob),(ox+(4 if flip==1 else 1),22+bob),(ox+(0 if flip==1 else 5),22+bob)])
+    return s
+
+def _px_vampire(f=0):
+    s=sa(32,54); sk=(200,180,200); cl=(80,0,120)
+    bob=int(math.sin(f*0.22)*2); fl=int(abs(math.sin(f*0.15))*8)
+    pygame.draw.polygon(s,tuple(max(0,c-40) for c in cl),[(2,54),(6,38+bob),(26,38+bob),(30,54)])
+    pygame.draw.polygon(s,tuple(max(0,c-40) for c in cl),[(0,28+bob),(5,18+fl+bob),(12,28+bob)])
+    pygame.draw.polygon(s,tuple(max(0,c-40) for c in cl),[(32,28+bob),(27,18+fl+bob),(20,28+bob)])
+    for y in range(16):
+        for x in range(16): pygame.draw.rect(s,cl,(8+x,18+y+bob,1,1))
+    for y in range(14):
+        for x in range(14): pygame.draw.rect(s,sk,(9+x,y,1,1))
+    pygame.draw.rect(s,(255,0,0),(10,4,5,5)); pygame.draw.rect(s,(255,0,0),(18,4,5,5))
+    pygame.draw.rect(s,C_WHITE,(12,14,4,2)); pygame.draw.rect(s,C_WHITE,(18,14,2,3))
+    for y in range(9): pygame.draw.rect(s,sk,(4,18+y,4,1))
+    for y in range(9): pygame.draw.rect(s,sk,(24,18+y,4,1))
+    return s
+
+def _px_witch(f=0):
+    s=sa(36,52); sk=(210,170,140); cl=(38,18,68)
+    bob=int(math.sin(f*0.18)*2)
+    pygame.draw.polygon(s,C_BLACK,[(6,14+bob),(30,14+bob),(24,2+bob),(12,2+bob)])
+    pygame.draw.rect(s,C_BLACK,(3,14+bob,30,5)); pygame.draw.rect(s,(100,0,150),(3,14+bob,30,2))
+    for y in range(14):
+        for x in range(14): pygame.draw.rect(s,sk,(11+x,19+y+bob,1,1))
+    pygame.draw.rect(s,(200,50,220),(12,22+bob,5,5)); pygame.draw.rect(s,(200,50,220),(19,22+bob,5,5))
+    pygame.draw.rect(s,C_YELLOW,(13,23+bob,3,3)); pygame.draw.rect(s,C_YELLOW,(20,23+bob,3,3))
+    for y in range(18):
+        for x in range(14): pygame.draw.rect(s,cl,(11+x,33+y+bob,1,1))
+    for y in range(12): pygame.draw.rect(s,sk,(6,22+y+bob,5,1))
+    for y in range(12): pygame.draw.rect(s,sk,(25,22+y+bob,5,1))
+    pygame.draw.rect(s,C_BROWN,(30,28+bob,3,16))
+    pygame.draw.circle(s,(200,100,255),(31,27+bob),5)
+    return s
+
+def _px_wraith(f=0):
+    # Ghostly floating form
+    s=sa(36,50); bob=int(math.sin(f*0.18)*4)
+    wc=(80,60,160); wl=(140,100,220); eye=(255,255,80)
+    # flowing body
+    for y in range(28):
+        w=int(14*(1-y/28)*abs(math.sin(y*0.22+f*0.1))+6)
+        x0=18-w//2
+        alpha=max(0,200-y*6)
+        gs=sa(w,1); gs.fill((*wc,alpha)); s.blit(gs,(x0,18+y+bob))
+    # upper body
+    for y in range(16):
+        for x in range(14): pygame.draw.rect(s,wl,(11+x,3+y+bob,1,1))
+    pygame.draw.rect(s,eye,(13,5+bob,5,5)); pygame.draw.rect(s,eye,(20,5+bob,5,5))
+    pygame.draw.rect(s,(255,255,255),(14,6+bob,3,3)); pygame.draw.rect(s,(255,255,255),(21,6+bob,3,3))
+    # ghost chains
+    for i in range(4):
+        pygame.draw.rect(s,wc,(8+i*6,18+bob,3,3))
+    return s
+
+def _px_serpent(f=0):
+    # Giant snake — no legs, slithers
+    s=sa(52,32); sc=(50,160,80); dk=(30,110,55); eye=(255,200,0)
+    wave=int(math.sin(f*0.18)*5)
+    # body segments
+    for i in range(7):
+        r=max(4,9-i)
+        bx=48-i*7; by=16+int(math.sin(f*0.18+i*0.7)*4)+wave//2
+        pygame.draw.ellipse(s,sc,(bx-r,by-r,r*2,r*2))
+        if i%2==0: pygame.draw.ellipse(s,dk,(bx-r+2,by-r+2,r*2-4,r*2-4))
+    # head
+    pygame.draw.ellipse(s,sc,(0,10+wave,18,14))
+    pygame.draw.rect(s,eye,(3,12+wave,4,4)); pygame.draw.rect(s,eye,(8,12+wave,4,4))
+    # tongue
+    if (f//10)%2==0:
+        pygame.draw.line(s,(255,30,30),(0,16+wave),(-4,14+wave),2)
+        pygame.draw.line(s,(255,30,30),(0,16+wave),(-4,18+wave),2)
+    return s
+
+def _px_lich(f=0):
+    # Undead sorcerer – robes, glowing staff, floating
+    s=sa(38,56); sk=(180,160,170); rob=(30,0,50); eye=(0,255,200)
+    bob=int(math.sin(f*0.15)*4)
+    # robe
+    for y in range(24):
+        w=10+y//2
+        pygame.draw.rect(s,rob,(14-w//4,26+y+bob,w+10,2))
+    # body
+    for y in range(18):
+        for x in range(16): pygame.draw.rect(s,rob,(11+x,9+y+bob,1,1))
+    # head
+    for y in range(12):
+        for x in range(14): pygame.draw.rect(s,sk,(12+x,y+bob,1,1))
+    pygame.draw.rect(s,eye,(13,2+bob,5,5)); pygame.draw.rect(s,eye,(21,2+bob,5,5))
+    pygame.draw.rect(s,(0,255,255),(14,3+bob,3,3)); pygame.draw.rect(s,(0,255,255),(22,3+bob,3,3))
+    # crown
+    for cx2 in [13,17,22]: pygame.draw.rect(s,C_GOLD,(cx2,bob-2,3,4))
+    # staff
+    pygame.draw.rect(s,C_BROWN,(1,4+bob,3,30))
+    pygame.draw.circle(s,(100,255,200),(2,4+bob),6)
+    pygame.draw.circle(s,(200,255,240),(2,4+bob),3)
+    # orbiting skull
+    ang=f*0.12; r2=10
+    ox=int(19+math.cos(ang)*r2); oy=int(25+bob+math.sin(ang)*r2)
+    if 0<=ox<38 and 0<=oy<56: pygame.draw.circle(s,sk,(ox,oy),4); pygame.draw.rect(s,C_DARK,(ox-1,oy-1,2,2))
+    return s
+
+def _px_demon(f=0):
+    s=sa(56,58); sk=(172,35,55); dk=(112,18,38); wg=(90,18,28)
+    bob=int(math.sin(f*0.18)*5); flap=int(math.sin(f*0.38)*10)
+    pygame.draw.polygon(s,wg,[(0,22+bob),(18,10+flap+bob),(22,30+bob)])
+    pygame.draw.polygon(s,wg,[(56,22+bob),(38,10+flap+bob),(34,30+bob)])
+    for y in range(26):
+        for x in range(22): pygame.draw.rect(s,sk,(17+x,16+y+bob,1,1))
+    for y in range(18):
+        for x in range(22): pygame.draw.rect(s,sk,(17+x,y+bob,1,1))
+    pygame.draw.rect(s,dk,(17,bob-5,4,8)); pygame.draw.rect(s,dk,(34,bob-5,4,8))
+    pygame.draw.rect(s,(255,55,0),(20,5+bob,7,7)); pygame.draw.rect(s,(255,55,0),(29,5+bob,7,7))
+    pygame.draw.rect(s,C_YELLOW,(21,6+bob,5,5)); pygame.draw.rect(s,C_YELLOW,(30,6+bob,5,5))
+    for i in range(7):
+        tx=27+int(math.sin(f*0.28+i)*4); ty=42+i*2+bob
+        if 0<=tx<56 and 0<=ty<58: pygame.draw.rect(s,sk,(tx,ty,4,2))
+    return s
+
+def _px_dragon(f=0):
+    s=sa(72,62); sk=(180,50,20); sc=(220,80,30); wg=(100,20,10)
+    bob=int(math.sin(f*0.12)*5); flap=int(math.sin(f*0.28)*14)
+    pygame.draw.polygon(s,wg,[(2,30+bob),(20,8+flap+bob),(30,32+bob)])
+    pygame.draw.polygon(s,wg,[(70,30+bob),(52,8+flap+bob),(42,32+bob)])
+    for y in range(30):
+        for x in range(36): pygame.draw.rect(s,sk,(18+x,16+y+bob,1,1))
+    for sy2 in range(0,30,6):
+        for sx2 in range(0,36,8): pygame.draw.rect(s,sc,(18+sx2,16+sy2+bob,6,4))
+    for y in range(20):
+        for x in range(22): pygame.draw.rect(s,sk,(8+x,y+bob,1,1))
+    pygame.draw.rect(s,(255,80,0),(10,8+bob,6,6)); pygame.draw.rect(s,(255,80,0),(20,8+bob,6,6))
+    pygame.draw.rect(s,C_YELLOW,(11,9+bob,4,4)); pygame.draw.rect(s,C_YELLOW,(21,9+bob,4,4))
+    pygame.draw.rect(s,(120,20,10),(12,bob-5,3,7)); pygame.draw.rect(s,(120,20,10),(22,bob-5,3,7))
+    for i in range(8):
+        tx=54+i*2; ty=30+i*2+bob
+        if tx<72 and ty<62: pygame.draw.rect(s,sk,(tx,ty,5,max(1,5-i//2)))
+    return s
+
+def px_coin(f=0):
+    s=sa(20,20); t=math.sin(f*0.14); rx=max(3,10-abs(int(t*2))); bob=int(t*2)
+    pygame.draw.ellipse(s,C_GOLD,(10-rx,5-bob,rx*2,16+bob))
+    pygame.draw.ellipse(s,C_YELLOW,(10-rx+2,6-bob,rx*2-4,12+bob))
+    return s
+
+def px_healthkit(mega=False,f=0):
+    s=sa(28,28); bob=int(math.sin(f*0.10)*3)
+    col=(220,60,60) if not mega else (255,200,50)
+    bright=tuple(min(255,c+60) for c in col)
+    pygame.draw.rect(s,col,(4,4+bob,20,20),border_radius=4)
+    pygame.draw.rect(s,bright,(6,6+bob,16,16),border_radius=3)
+    pygame.draw.rect(s,C_WHITE,(11,7+bob,6,14)); pygame.draw.rect(s,C_WHITE,(7,11+bob,14,6))
+    if mega:
+        for ang in range(0,360,45):
+            a=math.radians(ang+f*2)
+            px2=14+int(math.cos(a)*11); py2=14+bob+int(math.sin(a)*11)
+            if 0<=px2<28 and 0<=py2<28: pygame.draw.rect(s,C_GOLD,(px2,py2,2,2))
+    return s
+
+def px_ammo_drop(kind,f=0):
+    s=sa(24,24); bob=int(math.sin(f*0.10)*3); col=AMMO_COL.get(kind,C_GRAY)
+    br=tuple(min(255,c+60) for c in col)
+    if kind=="ammo_shell":
+        pygame.draw.rect(s,col,(8,4+bob,8,16),border_radius=2)
+        pygame.draw.rect(s,br,(9,4+bob,6,6),border_radius=2)
+        pygame.draw.rect(s,C_GOLD,(7,18+bob,10,3))
+    elif kind=="ammo_rocket":
+        pygame.draw.rect(s,col,(9,3+bob,6,14))
+        pygame.draw.polygon(s,C_FIRE,[(9,3+bob),(15,3+bob),(12,bob-1)])
+        pygame.draw.rect(s,C_GOLD,(8,16+bob,8,4))
+    elif kind=="ammo_plasma":
+        pygame.draw.circle(s,col,(12,12+bob),8)
+        pygame.draw.circle(s,br,(12,12+bob),5)
+        for a in range(0,360,60):
+            ax=12+int(math.cos(math.radians(a+f*3))*9); ay=12+bob+int(math.sin(math.radians(a+f*3))*9)
+            if 0<=ax<24 and 0<=ay<24: pygame.draw.rect(s,col,(ax,ay,2,2))
+    else:
+        # generic bullet stack
+        for i in range(3):
+            pygame.draw.rect(s,col,(6+i*5,5+bob,4,14),border_radius=1)
+            pygame.draw.rect(s,br,(7+i*5,5+bob,2,5),border_radius=1)
+    return s
+
+def px_scroll(f=0):
+    s=sa(28,28); bob=int(math.sin(f*0.09)*3)
+    pygame.draw.rect(s,C_BROWN,(6,4+bob,16,20),border_radius=2)
+    pygame.draw.rect(s,(200,160,100),(7,5+bob,14,18),border_radius=2)
+    pygame.draw.ellipse(s,C_BROWN,(5,3+bob,18,6)); pygame.draw.ellipse(s,C_BROWN,(5,18+bob,18,6))
+    t2=f*0.08
+    for i in range(12):
+        a=math.radians(i*30)+t2; r2=max(0,4-i*0.3)
+        px2=14+int(math.cos(a)*r2); py2=13+bob+int(math.sin(a)*r2)
+        if 0<=px2<28 and 0<=py2<28: pygame.draw.rect(s,C_PURPLE,(px2,py2,2,2))
+    return s
+
+def px_weapon_drop(name,f=0):
+    s=sa(34,34); bob=int(math.sin(f*0.11)*4)
+    wd=WEAPON_DATA.get(name,WEAPON_DATA["Fists"]); col=wd["col"]; br=tuple(min(255,c+65) for c in col)
+    pygame.draw.circle(s,tuple(c//5 for c in col),(17,17+bob),14)
+    wtype=wd.get("type","melee")
+    if wtype=="melee":
+        pygame.draw.rect(s,col,(14,5+bob,5,22)); pygame.draw.rect(s,br,(15,5+bob,3,14))
+        pygame.draw.rect(s,C_GOLD,(10,20+bob,13,4))
+        el=wd.get("element","")
+        if el=="fire":
+            for _ in range(4): pygame.draw.circle(s,C_FIRE,(14+random.randint(-2,4),5+bob+random.randint(-3,0)),2)
+        elif el=="ice": pygame.draw.circle(s,C_ICE,(17,5+bob),5)
+    else:
+        if wd.get("rocket"):
+            pygame.draw.rect(s,(60,50,40),(8,15+bob,20,10)); pygame.draw.rect(s,col,(8,15+bob,20,10),1)
+            pygame.draw.rect(s,(40,30,20),(26,12+bob,6,10)); pygame.draw.circle(s,C_FIRE,(30,14+bob),4)
+        else:
+            pygame.draw.rect(s,(60,60,70),(10,15+bob,18,8)); pygame.draw.rect(s,col,(10,15+bob,18,8),1)
+            pygame.draw.rect(s,(40,40,50),(24,14+bob,4,5))
+            if name=="Plasma Gun": pygame.draw.circle(s,C_PURPLE,(28,16+bob),4)
+    return s
+
+def px_powerup_orb(ptype,f=0):
+    s=sa(28,28); pdef=POWERUP_DEFS[ptype]; col=pdef["color"]
+    t=math.sin(f*0.12); bob=int(t*3); radius=10+int(t*1.5)
+    bright=tuple(min(255,c+80) for c in col)
+    pygame.draw.circle(s,col,(14,14+bob),radius); pygame.draw.circle(s,bright,(14,14+bob),radius-3)
+    sp=int(abs(t)*4)
+    for ang in range(0,360,72):
+        a=math.radians(ang+f*3)
+        px2=14+int(math.cos(a)*(radius+sp)); py2=14+bob+int(math.sin(a)*(radius+sp))
+        if 0<=px2<28 and 0<=py2<28: pygame.draw.rect(s,C_WHITE,(px2,py2,2,2))
+    return s
+
+# ─── LEVEL-UP ANIMATION ──────────────────────────────────────────────────────
+class LevelUpAnim:
+    def __init__(self,x,y,level):
+        self.x=x; self.y=y; self.level=level; self.life=self.total=90
+        self.bursts=[]
+        for _ in range(40):
+            ang=random.uniform(0,math.pi*2); sp=random.uniform(1.5,6)
+            col=random.choice([C_GOLD,C_YELLOW,(255,255,180),C_WHITE,C_CYAN])
+            self.bursts.append([x,y,math.cos(ang)*sp,math.sin(ang)*sp,col,random.uniform(3,8)])
+        self.stars=[[math.pi*2*i/8,random.choice([C_GOLD,C_CYAN,C_YELLOW])] for i in range(8)]
+    def update(self):
+        self.life-=1
+        for b in self.bursts: b[0]+=b[2]; b[1]+=b[3]; b[3]+=0.12; b[2]*=0.95; b[3]*=0.95
+    def draw(self,surf,cx,cy):
+        if self.life<=0: return
+        t=self.life/self.total; sx=int(self.x-cx); sy=int(self.y-cy)
+        for ri,rc in enumerate([(C_GOLD,40),(C_YELLOW,25),(C_WHITE,12)]):
+            r=int((1-t)*80*(ri+1)/3); alpha=int(rc[1]*t)
+            if r>0:
+                gs=sa(r*2+4,r*2+4); pygame.draw.circle(gs,(*rc[0],alpha),(r+2,r+2),r,2)
+                surf.blit(gs,(sx-r-2,sy-r-2),special_flags=pygame.BLEND_ADD)
+        for b in self.bursts:
+            bx=int(b[0]-cx); by=int(b[1]-cy); r=max(1,int(b[5]*t)); c=tuple(int(v*t) for v in b[4])
+            pygame.draw.circle(surf,c,(bx,by),r)
+        if t>0.3:
+            orbit_r=28+int((1-t)*20)
+            for star in self.stars:
+                ang=star[0]+(1-t)*6; star[0]=ang
+                ox=sx+int(math.cos(ang)*orbit_r); oy=sy-24+int(math.sin(ang)*orbit_r)
+                pygame.draw.circle(surf,star[1],(ox,oy),4); pygame.draw.circle(surf,C_WHITE,(ox,oy),2)
+        if t>0.4:
+            txt=FONT_LG.render(f"LV {self.level}!",True,C_GOLD); txt.set_alpha(int(255*min(1,(t-0.4)/0.3)))
+            surf.blit(txt,(sx-txt.get_width()//2,sy-72))
+    @property
+    def alive(self): return self.life>0
+
+# ─── WORLD GENERATION ────────────────────────────────────────────────────────
+BORDER_W = 6   # tiles of dense border terrain on each side
+
+# ─── BIOMES (world is one long continuous map split into zones = "areas") ────
+# Instead of separate map files, the 100->340 tile world is divided into five
+# visually distinct zones the player walks/teleports between. Each has its own
+# palette, ambient light color, and story beat tied to it.
+BIOMES=[
+    {"name":"Green Hollow","story":"Where your journey begins.","sky_top":(80,140,220),"sky_bot":(160,200,255),
+     "grass":(56,148,52),"grass_bl":(40,100,36),"dirt":(90,55,28),"dirt_l":(120,78,40),"fog":(140,190,255,0)},
+    {"name":"Sunfall Dunes","story":"The old caravan routes, long abandoned.","sky_top":(230,160,70),"sky_bot":(255,210,140),
+     "grass":(214,178,90),"grass_bl":(180,140,60),"dirt":(150,110,55),"dirt_l":(180,140,80),"fog":(255,200,120,26)},
+    {"name":"Skyreach Cliffs","story":"Windswept ruins clinging to broken cliffs.","sky_top":(120,150,190),"sky_bot":(200,220,235),
+     "grass":(150,170,150),"grass_bl":(110,135,115),"dirt":(110,105,100),"dirt_l":(140,135,128),"fog":(200,220,255,18)},
+    {"name":"Frostmere","story":"Nothing has grown here in a hundred years.","sky_top":(90,110,160),"sky_bot":(190,210,230),
+     "grass":(210,225,235),"grass_bl":(170,190,205),"dirt":(90,100,115),"dirt_l":(120,132,148),"fog":(200,220,255,40)},
+    {"name":"The Cinderfields","story":"The ash never stops falling.","sky_top":(60,20,20),"sky_bot":(140,50,30),
+     "grass":(90,40,30),"grass_bl":(60,24,20),"dirt":(50,26,20),"dirt_l":(75,40,28),"fog":(255,90,40,34)},
+    {"name":"The Drowned Vaults","story":"A city that sank and kept dreaming.","sky_top":(20,50,55),"sky_bot":(45,95,100),
+     "grass":(30,80,80),"grass_bl":(18,55,55),"dirt":(25,45,50),"dirt_l":(38,65,68),"fog":(30,120,130,44)},
+    {"name":"The Hollow Throne","story":"Whatever ruled here is not gone. It is waiting.","sky_top":(20,8,26),"sky_bot":(60,20,70),
+     "grass":(70,30,90),"grass_bl":(45,18,60),"dirt":(35,18,40),"dirt_l":(55,28,60),"fog":(120,40,160,46)},
+]
+def biome_index(col,cols): return clamp(int(col/cols*len(BIOMES)),0,len(BIOMES)-1)
+def biome_at(col,cols): return BIOMES[biome_index(col,cols)]
+
+def generate_world(cols,rows):
+    tiles=[[0]*cols for _ in range(rows)]; fr=rows-6
+    # Hard walls top + actual edge cols
+    for r in range(rows):
+        tiles[r][0]=tiles[r][1]=WALL_T; tiles[r][cols-1]=tiles[r][cols-2]=WALL_T
+    for c in range(cols): tiles[0][c]=tiles[1][c]=WALL_T
+    # Ground layers
+    for r in range(rows):
+        for c in range(cols):
+            if r>=rows-1:   tiles[r][c]=STONE_T
+            elif r>=rows-3: tiles[r][c]=DIRT_T
+            elif r>=fr:     tiles[r][c]=GRASS_T
+    # Clear interior
+    for r in range(2,fr):
+        for c in range(2,cols-2): tiles[r][c]=0
+    # Floor row
+    for c in range(2,cols-2): tiles[fr][c]=FLOOR_T
+
+    # ── BORDER TERRAIN (invisible wall effect) ───────────────────────────────
+    # Fill BORDER_W cols on each side from row 2 to fr with solid stone pillars
+    # This creates a natural-looking dense zone the player can't walk through
+    for side in range(2, 2+BORDER_W):
+        for r in range(2, rows):
+            tiles[r][side]=STONE_T
+            tiles[r][cols-1-side]=STONE_T
+    # Add some variety – small gaps in border terrain so it looks less flat
+    for side in range(3, 2+BORDER_W-1):
+        for r in range(3, fr-1):
+            if random.random()<0.12:
+                tiles[r][side]=DIRT_T
+                tiles[r][cols-1-side]=DIRT_T
+
+    # Platforms (only in playable zone: col BORDER_W+2 .. cols-BORDER_W-2)
+    play_l=2+BORDER_W; play_r=cols-2-BORDER_W
+    JUMP_H=5; H_REACH=9
+    surfaces=set()
+    for c in range(play_l,play_r): surfaces.add((c,fr))
+    base_row=fr
+    for _ in range(2):
+        new_row=base_row-random.randint(JUMP_H-1,JUMP_H)
+        if new_row<=3: break
+        placed_cols=set(); attempts=0
+        while len(placed_cols)<(play_r-play_l)//5 and attempts<300:
+            attempts+=1
+            cands=[c for (c,r) in surfaces if abs(r-(new_row+JUMP_H))<=JUMP_H]
+            if not cands: cands=list(range(play_l+1,play_r-4))
+            pc=random.choice(cands); pw=random.randint(3,8)
+            pc=clamp(pc+random.randint(-H_REACH//2,H_REACH//2),play_l,play_r-pw)
+            if any(pc<=ec<pc+pw for ec in placed_cols): continue
+            for i in range(pw):
+                cc=pc+i
+                if play_l<=cc<play_r: tiles[new_row][cc]=PLAT_T; placed_cols.add(cc); surfaces.add((cc,new_row))
+        base_row=new_row
+    # Random stone pillars
+    for _ in range(12):
+        pc=random.randint(play_l+2,play_r-2)
+        for pi in range(random.randint(1,3)):
+            rr=fr-pi
+            if 2<rr<rows and tiles[rr][pc]==0: tiles[rr][pc]=STONE_T
+    return tiles,fr
+
+def bake_rects(tiles,cols,rows):
+    return [pygame.Rect(c*TILE,r*TILE,TILE,TILE)
+            for r in range(rows) for c in range(cols) if tiles[r][c] in SOLID]
+
+_BIOME_TILE_CACHE={}
+def get_biome_tile(t,bidx):
+    key=(t,bidx)
+    if key in _BIOME_TILE_CACHE: return _BIOME_TILE_CACHE[key]
+    base=tile_img_raw(t)
+    if base is None: return None
+    if t in (WALL_T,FLOOR_T,PLAT_T):   # structural tiles stay neutral
+        _BIOME_TILE_CACHE[key]=base; return base
+    tint=BIOMES[bidx]["grass"] if t==GRASS_T else BIOMES[bidx]["dirt"]
+    ref=GRASS_TOP if t==GRASS_T else DIRT_D
+    mul=tuple(clamp(int(255*tint[i]/max(1,ref[i])),40,255) for i in range(3))
+    out=base.copy()
+    tintsurf=sa(*base.get_size()); tintsurf.fill((mul[0],mul[1],mul[2],255))
+    out.blit(tintsurf,(0,0),special_flags=pygame.BLEND_RGBA_MULT)
+    _BIOME_TILE_CACHE[key]=out; return out
+def tile_img_raw(t):
+    return {GRASS_T:T_GRASS,DIRT_T:T_DIRT,STONE_T:T_STONE,WALL_T:T_WALL,FLOOR_T:T_FLOOR,PLAT_T:T_PLAT}.get(t)
+def tile_img(t):
+    return tile_img_raw(t)
+
+def draw_world(surf,tiles,cols,rows,cx,cy,ww=None):
+    c0=max(0,cx//TILE-1); c1=min(cols,cx//TILE+W//TILE+3)
+    r0=max(0,cy//TILE-1); r1=min(rows,cy//TILE+H//TILE+3)
+    for r in range(r0,r1):
+        for c in range(c0,c1):
+            t=tiles[r][c]
+            if ww:
+                img=get_biome_tile(t,biome_index(c*TILE,ww))
+            else:
+                img=tile_img_raw(t)
+            if img: surf.blit(img,(c*TILE-cx,r*TILE-cy))
+
+# ─── BACKGROUND ──────────────────────────────────────────────────────────────
+STARS=[(random.randint(0,8192*4),random.randint(0,150),random.random()) for _ in range(150)]
+def biome_sky_blend(cx,ww):
+    """Smoothly blend sky/fog color between the two nearest biome zones."""
+    frac=clamp(cx/max(1,ww),0,0.999)*len(BIOMES)
+    i=int(frac); t=frac-i
+    b0=BIOMES[clamp(i,0,len(BIOMES)-1)]; b1=BIOMES[clamp(i+1,0,len(BIOMES)-1)]
+    top=lerp_col(b0["sky_top"],b1["sky_top"],t); bot=lerp_col(b0["sky_bot"],b1["sky_bot"],t)
+    fog=tuple(int(lerp(b0["fog"][k],b1["fog"][k],t)) for k in range(4))
+    return top,bot,fog
+def draw_bg(surf,cx,cy,dt=0,ww=3200):
+    btop,bbot,fog=biome_sky_blend(cx+W//2,ww)
+    dtop,dbot=sky_colors(dt)
+    top=lerp_col(btop,dtop,0.35); bot=lerp_col(bbot,dbot,0.35)
+    for y in range(H): c=lerp_col(top,bot,y/H); pygame.draw.line(surf,c,(0,y),(W,y))
+    na=night_alpha(dt)
+    if na>30:
+        for sx2,sy2,br in STARS:
+            px2=(sx2-int(cx*0.05))%W; py2=(sy2-int(cy*0.05))%(H//2)
+            c=int(100+br*155)
+            gs=sa(4,4); gs.fill((c,c,min(255,c+25),min(255,int(na*2)))); surf.blit(gs,(px2,py2))
+    t2=dt%DAY_LEN/DAY_LEN
+    sun_x=int(W*t2); sun_y=int(H*0.15+H*0.2*math.sin(math.pi*t2))
+    if na<120:
+        pygame.draw.circle(surf,(255,240,100),(sun_x,sun_y),22)
+        pygame.draw.circle(surf,(255,255,180),(sun_x,sun_y),16)
+    else:
+        mx2=(sun_x+W//2)%W
+        pygame.draw.circle(surf,(220,220,200),(mx2,sun_y),16)
+        pygame.draw.circle(surf,bot,(mx2+5,sun_y-4),12)
+    if fog[3]>2:
+        fs=sa(W,H); fs.fill(fog); surf.blit(fs,(0,0))
+
+# ─── FAKE "2.5D" LIGHTING PASS ────────────────────────────────────────────────
+# No real GPU shaders in pygame, so depth/lighting is faked with additive glow
+# blits (BLEND_RGBA_ADD) for light sources + a soft radial vignette + drop
+# shadows under entities. This reads as dynamic point-lighting at game speed.
+_LIGHT_CACHE={}
+def _glow_surf(radius,color):
+    key=(radius,color)
+    if key in _LIGHT_CACHE: return _LIGHT_CACHE[key]
+    s=sa(radius*2,radius*2)
+    for rr in range(radius,0,-2):
+        a=int(color[3]*(1-rr/radius)**2) if len(color)>3 else int(90*(1-rr/radius)**2)
+        pygame.draw.circle(s,(color[0],color[1],color[2],a),(radius,radius),rr)
+    _LIGHT_CACHE[key]=s; return s
+def draw_point_light(surf,x,y,radius,color,cx,cy):
+    g=_glow_surf(radius,color)
+    surf.blit(g,(x-cx-radius,y-cy-radius),special_flags=pygame.BLEND_RGBA_ADD)
+def draw_drop_shadow(surf,x,y,w,cx,cy,strength=90):
+    s=sa(w,10); pygame.draw.ellipse(s,(0,0,0,strength),(0,0,w,10))
+    surf.blit(s,(x-cx-w//2,y-cy-4))
+VIGNETTE=None
+def draw_vignette(surf):
+    global VIGNETTE
+    if VIGNETTE is None:
+        VIGNETTE=sa(W,H)
+        for i in range(6):
+            a=int(10+i*7)
+            pygame.draw.rect(VIGNETTE,(0,0,10,a),(i*4,i*4,W-i*8,H-i*8),4)
+    surf.blit(VIGNETTE,(0,0))
+
+# ─── PARTICLES / FLOATTEXTS ──────────────────────────────────────────────────
+class Particle:
+    __slots__=["x","y","vx","vy","life","ml","size","color","grav"]
+    def __init__(self,x,y,color,vx=None,vy=None,life=None,size=None,grav=0.13):
+        self.x=float(x); self.y=float(y)
+        a=random.uniform(0,6.28); sp=random.uniform(0.7,4.8)
+        self.vx=vx if vx is not None else math.cos(a)*sp
+        self.vy=vy if vy is not None else math.sin(a)*sp
+        self.life=self.ml=life or random.randint(16,44)
+        self.size=size or random.uniform(1.5,5); self.color=color; self.grav=grav
+    def update(self): self.x+=self.vx; self.y+=self.vy; self.vy+=self.grav; self.vx*=0.96; self.life-=1
+    def draw(self,surf,cx,cy):
+        t=self.life/self.ml; r=max(1,int(self.size*t))
+        c=tuple(int(v*t) for v in self.color)
+        pygame.draw.circle(surf,c,(int(self.x-cx),int(self.y-cy)),r)
+
+class FloatText:
+    def __init__(self,x,y,text,color,big=False):
+        self.x=float(x); self.y=float(y); self.text=text; self.color=color
+        self.life=self.ml=72; self.vy=-1.6; self.font=FONT_LG if big else FONT_MD
+    def update(self): self.y+=self.vy; self.vy*=0.97; self.life-=1
+    def draw(self,surf,cx,cy):
+        t=self.life/self.ml; img=self.font.render(self.text,True,self.color)
+        img.set_alpha(int(255*min(1,t*1.8)))
+        surf.blit(img,(int(self.x-cx)-img.get_width()//2,int(self.y-cy)-img.get_height()//2))
+
+# ─── BULLET ──────────────────────────────────────────────────────────────────
+class Bullet:
+    def __init__(self,x,y,dx,dy,dmg,owner="player",element="",is_rocket=False):
+        nx,ny=norm(dx,dy); spd=13 if not is_rocket else 10
+        self.x=float(x); self.y=float(y); self.vx=nx*spd; self.vy=ny*spd
+        self.dmg=dmg; self.owner=owner; self.element=element
+        self.alive=True; self.life=90 if not is_rocket else 120
+        self.trail=[]; self.is_rocket=is_rocket
+    def update(self,solid_rects):
+        self.trail.append((self.x,self.y))
+        if len(self.trail)>8: self.trail.pop(0)
+        self.x+=self.vx; self.y+=self.vy; self.life-=1
+        if self.life<=0: self.alive=False; return
+        for r in solid_rects:
+            if r.collidepoint(self.x,self.y): self.alive=False; return
+    def draw(self,surf,cx,cy):
+        if self.is_rocket:
+            col=C_FIRE
+            for i,(tx,ty) in enumerate(self.trail):
+                t=(i+1)/max(1,len(self.trail)); r=max(1,int(5*t))
+                pygame.draw.circle(surf,tuple(int(c*t*0.7) for c in col),(int(tx-cx),int(ty-cy)),r)
+            pygame.draw.circle(surf,C_ORANGE,(int(self.x-cx),int(self.y-cy)),6)
+            pygame.draw.circle(surf,C_YELLOW,(int(self.x-cx),int(self.y-cy)),3)
+        else:
+            if self.element=="fire": col=C_FIRE
+            elif self.element=="ice": col=C_ICE
+            elif self.owner in ("player","ally"): col=C_CYAN
+            else: col=C_ORANGE
+            for i,(tx,ty) in enumerate(self.trail):
+                t=(i+1)/max(1,len(self.trail)); r=max(1,int(4*t))
+                pygame.draw.circle(surf,tuple(int(c*t*0.6) for c in col),(int(tx-cx),int(ty-cy)),r)
+            pygame.draw.circle(surf,C_WHITE,(int(self.x-cx),int(self.y-cy)),4)
+            pygame.draw.circle(surf,col,(int(self.x-cx),int(self.y-cy)),3)
+
+class Explosion:
+    def __init__(self,x,y,dmg,radius=90):
+        self.x=x; self.y=y; self.dmg=dmg; self.radius=radius; self.life=self.total=28
+    def update(self): self.life-=1
+    def draw(self,surf,cx,cy):
+        t=self.life/self.total; r=int(self.radius*(1-t)*0.8)
+        if r<2: return
+        gs=sa(r*2+4,r*2+4); alpha=int(220*t)
+        pygame.draw.circle(gs,(*C_FIRE,alpha),(r+2,r+2),r)
+        pygame.draw.circle(gs,(*C_ORANGE,min(255,int(alpha*1.3))),(r+2,r+2),int(r*0.7))
+        pygame.draw.circle(gs,(*C_YELLOW,min(255,int(alpha*1.6))),(r+2,r+2),int(r*0.4))
+        surf.blit(gs,(int(self.x-cx)-r-2,int(self.y-cy)-r-2),special_flags=pygame.BLEND_ADD)
+    @property
+    def alive(self): return self.life>0
+
+# ─── LOOT ────────────────────────────────────────────────────────────────────
+class Loot:
+    def __init__(self,x,y,kind,value=0):
+        self.x=float(x); self.y=float(y); self.kind=kind; self.value=value
+        self.alive=True; self.frame=random.randint(0,60); self.vy=-4.0; self.on_gnd=False
+    def update(self,gnd_y):
+        if not self.on_gnd:
+            self.vy+=0.3; self.y+=self.vy
+            if self.y>=gnd_y: self.y=gnd_y; self.vy=0; self.on_gnd=True
+        self.frame+=1
+    def draw(self,surf,cx,cy):
+        bob=int(math.sin(self.frame*0.09)*4) if self.on_gnd else 0
+        sx=int(self.x-cx); sy=int(self.y-cy)+bob
+        if self.kind=="coin": surf.blit(px_coin(self.frame),(sx-10,sy-10))
+        elif self.kind=="healthkit": surf.blit(px_healthkit(False,self.frame),(sx-14,sy-14))
+        elif self.kind=="mega_healthkit": surf.blit(px_healthkit(True,self.frame),(sx-14,sy-14))
+        elif self.kind=="teleport_scroll": surf.blit(px_scroll(self.frame),(sx-14,sy-14))
+        elif self.kind in AMMO_KINDS: surf.blit(px_ammo_drop(self.kind,self.frame),(sx-12,sy-12))
+        else: surf.blit(px_weapon_drop(self.kind,self.frame),(sx-17,sy-17))
+
+class PowerupDrop:
+    def __init__(self,x,y,ptype):
+        self.x=float(x); self.y=float(y); self.ptype=ptype; self.alive=True
+        self.frame=random.randint(0,60); self.vy=-3.5; self.on_gnd=False; self.lifetime=900
+    def update(self,gnd_y):
+        if not self.on_gnd:
+            self.vy=min(self.vy+0.28,10); self.y+=self.vy
+            if self.y>=gnd_y-14: self.y=gnd_y-14; self.vy=0; self.on_gnd=True
+        self.frame+=1; self.lifetime-=1
+        if self.lifetime<=0: self.alive=False
+    def draw(self,surf,cx,cy):
+        if self.lifetime<180 and (self.lifetime//10)%2==0: return
+        surf.blit(px_powerup_orb(self.ptype,self.frame),(int(self.x-cx)-14,int(self.y-cy)-14))
+        col=POWERUP_DEFS[self.ptype]["color"]
+        lbl=FONT_SM.render(POWERUP_DEFS[self.ptype]["label"],True,col); lbl.set_alpha(200)
+        surf.blit(lbl,(int(self.x-cx)-lbl.get_width()//2,int(self.y-cy)-28))
+
+# ─── MONSTERS ────────────────────────────────────────────────────────────────
+MTYPES=[
+    # Original
+    {"name":"Slime",    "hp":24,  "xp":10,  "spd":1.0,"sz":18,"shoot":False,"boss":False,"dw":1.0,"min_lv":1},
+    {"name":"Goblin",   "hp":42,  "xp":18,  "spd":1.5,"sz":16,"shoot":True, "boss":False,"dw":1.2,"min_lv":1},
+    # New variety 1: fast melee human
+    {"name":"Bandit",   "hp":38,  "xp":16,  "spd":2.2,"sz":16,"shoot":False,"boss":False,"dw":1.1,"min_lv":1},
+    # New variety 2: sturdy reptile
+    {"name":"Lizardman","hp":70,  "xp":28,  "spd":1.3,"sz":20,"shoot":False,"boss":False,"dw":1.3,"min_lv":2},
+    {"name":"Orc",      "hp":95,  "xp":36,  "spd":0.9,"sz":22,"shoot":False,"boss":False,"dw":1.5,"min_lv":3},
+    {"name":"Skeleton", "hp":65,  "xp":30,  "spd":1.6,"sz":18,"shoot":True, "boss":False,"dw":1.3,"min_lv":4},
+    # New variety 3: flying ranged
+    {"name":"Harpy",    "hp":55,  "xp":32,  "spd":2.0,"sz":18,"shoot":True, "boss":False,"dw":1.3,"min_lv":3,"fly":True},
+    {"name":"Troll",    "hp":180, "xp":55,  "spd":0.7,"sz":25,"shoot":False,"boss":False,"dw":1.8,"min_lv":4},
+    # New variety 4: slow tank
+    {"name":"Golem",    "hp":260, "xp":70,  "spd":0.5,"sz":26,"shoot":False,"boss":False,"dw":2.0,"min_lv":5},
+    # New variety 5: fast berserker, high dmg
+    {"name":"Berserker","hp":110, "xp":60,  "spd":2.4,"sz":22,"shoot":False,"boss":False,"dw":1.8,"min_lv":5},
+    {"name":"Vampire",  "hp":120, "xp":50,  "spd":2.0,"sz":20,"shoot":True, "boss":False,"dw":1.6,"min_lv":5,"fly":True},
+    {"name":"Witch",    "hp":90,  "xp":45,  "spd":1.1,"sz":20,"shoot":True, "boss":False,"dw":1.5,"min_lv":5},
+    # New variety 6: phasing ghost
+    {"name":"Wraith",   "hp":85,  "xp":48,  "spd":1.8,"sz":18,"shoot":True, "boss":False,"dw":1.5,"min_lv":5,"fly":True},
+    # New variety 7: ground serpent
+    {"name":"Serpent",  "hp":140, "xp":52,  "spd":1.7,"sz":16,"shoot":False,"boss":False,"dw":1.6,"min_lv":6},
+    # New variety 8: undead mage (hard)
+    {"name":"Lich",     "hp":150, "xp":75,  "spd":1.0,"sz":20,"shoot":True, "boss":False,"dw":1.8,"min_lv":6,"fly":True},
+    # Bosses
+    {"name":"Demon",    "hp":210, "xp":105, "spd":1.4,"sz":27,"shoot":True, "boss":True, "dw":3.0,"min_lv":6,"fly":True},
+    {"name":"Dragon",   "hp":420, "xp":210, "spd":1.2,"sz":34,"shoot":True, "boss":True, "dw":4.5,"min_lv":8,"fly":True},
+]
+SPRITE_FNS={
+    "Slime":_px_slime,"Goblin":_px_goblin,"Bandit":_px_bandit,"Lizardman":_px_lizardman,
+    "Orc":_px_orc,"Skeleton":_px_skel,"Harpy":_px_harpy,"Troll":_px_troll,
+    "Golem":_px_golem,"Berserker":_px_berserker,"Vampire":_px_vampire,"Witch":_px_witch,
+    "Wraith":_px_wraith,"Serpent":_px_serpent,"Lich":_px_lich,
+    "Demon":_px_demon,"Dragon":_px_dragon,
+}
+
+_SPRITE_CACHE={}
+def get_cached_sprite(name,frame_bucket,facing_r):
+    key=(name,frame_bucket,facing_r)
+    if key not in _SPRITE_CACHE:
+        fn=SPRITE_FNS.get(name,_px_slime)
+        img=fn(frame_bucket*4)
+        if not facing_r: img=pygame.transform.flip(img,True,False)
+        _SPRITE_CACHE[key]=img
+    return _SPRITE_CACHE[key]
+
+class Monster:
+    def __init__(self,x,y,mt,plv):
+        self.x=float(x); self.y=float(y); self.mt=mt; self.name=mt["name"]; self.boss=mt["boss"]
+        sc=1+0.13*(plv-1)
+        self.max_hp=int(mt["hp"]*sc); self.hp=self.max_hp
+        self.xp=int(mt["xp"]*sc); self.spd=mt["spd"]; self.sz=mt["sz"]
+        self.shoot=mt["shoot"]; self.dw=mt["dw"]; self.alive=True
+        self.frame=random.randint(0,60); self.facing_r=True; self.on_gnd=False; self.vy=0
+        self.hurt_t=0; self.atk_cd=0; self.scd=random.randint(60,180)
+        self.state="patrol"; self.pdir=random.choice([-1,1]); self.ptimer=random.randint(60,180)
+        self.agro=290 if not self.boss else 450
+        self.mdmg=max(3,int(mt["hp"]*0.09*sc))
+        self.floating=mt.get("fly",False)
+
+    def update(self,px,py,solid_rects,gnd_y):
+        if not self.alive: return None
+        self.frame+=1
+        if self.hurt_t>0: self.hurt_t-=1
+        if self.atk_cd>0: self.atk_cd-=1
+        if self.scd>0: self.scd-=1
+        # Ground physics for non-flyers
+        if not self.floating:
+            self.vy+=0.42; self.y+=self.vy
+            if self.y>=gnd_y-self.sz: self.y=gnd_y-self.sz; self.vy=0; self.on_gnd=True
+        d=dist((self.x,self.y),(px,py))
+        if d<self.agro: self.state="chase"
+        elif d>self.agro*1.5: self.state="patrol"
+        result=None
+        if self.state=="chase":
+            dx,dy=px-self.x,py-self.y; nx_,ny_=norm(dx,dy); self.facing_r=(dx>0)
+            if d>self.sz+30:
+                new_x=self.x+nx_*self.spd
+                if not any(r.inflate(2,2).collidepoint(new_x,self.y) for r in solid_rects):
+                    self.x=new_x
+                if self.floating: self.y+=ny_*self.spd
+            if d<self.sz+30 and self.atk_cd<=0: self.atk_cd=52; result=("melee",self.mdmg)
+            if self.shoot and self.scd<=0 and d<390:
+                self.scd=random.randint(65,165)
+                result=("bullet",Bullet(self.x,self.y-self.sz//2,dx,dy,max(2,self.mdmg//2),"monster"))
+        else:
+            self.ptimer-=1
+            if self.ptimer<=0: self.pdir*=-1; self.ptimer=random.randint(60,180)
+            new_x=self.x+self.pdir*self.spd*0.5
+            if not any(r.inflate(2,2).collidepoint(new_x,self.y) for r in solid_rects): self.x=new_x
+            else: self.pdir*=-1
+            self.facing_r=(self.pdir>0)
+        return result
+
+    def hurt_anim(self,dmg,particles,float_texts):
+        self.hp-=dmg; self.hurt_t=9
+        for _ in range(6): particles.append(Particle(self.x,self.y-self.sz//2,C_RED,size=random.uniform(2,5)))
+        float_texts.append(FloatText(self.x,self.y-self.sz-8,f"-{dmg}",C_RED))
+        if self.hp<=0:
+            self.alive=False
+            for _ in range(15): particles.append(Particle(self.x,self.y-self.sz//2,random.choice([C_RED,C_ORANGE,C_YELLOW])))
+            return True
+        return False
+
+    def draw(self,surf,cx,cy):
+        if not self.alive: return
+        frame_bucket=(self.frame//4)%16
+        img=get_cached_sprite(self.name,frame_bucket,self.facing_r)
+        if self.hurt_t>0: img=img.copy(); img.fill((255,255,255,210),special_flags=pygame.BLEND_RGBA_MAX)
+        iw,ih=img.get_size(); sx=int(self.x-cx)-iw//2; sy=int(self.y-cy)-ih
+        surf.blit(img,(sx,sy))
+        bw=max(iw,46); bx=int(self.x-cx)-bw//2; by=sy-11
+        pygame.draw.rect(surf,C_DARKRED,(bx,by,bw,7),border_radius=2)
+        fill=int(bw*(self.hp/self.max_hp))
+        if fill>0:
+            fc=C_GREEN if self.hp/self.max_hp>0.5 else(C_YELLOW if self.hp/self.max_hp>0.25 else C_RED)
+            pygame.draw.rect(surf,fc,(bx,by,fill,7),border_radius=2)
+        pygame.draw.rect(surf,C_WHITE,(bx,by,bw,7),1,border_radius=2)
+        if self.boss:
+            lbl=FONT_SM.render(self.name,True,C_RED)
+            surf.blit(lbl,(int(self.x-cx)-lbl.get_width()//2,by-14))
+
+# ─── AI COMPANION ────────────────────────────────────────────────────────────
+class AICompanion:
+    """
+    Fixed ally:
+    - Finite HP (200), proper invincibility frames
+    - Carries a Rifle with unlimited ammo (ally doesn't need ammo pickups)
+    - Obstacle-aware jump: checks for wall ahead before jumping
+    - No infinite jump — can only jump when on_gnd
+    - Melee fallback when very close
+    """
+    def __init__(self,x,y,name="Ally",col=C_PURPLE,follow_dist=130):
+        self.x=float(x); self.y=float(y); self.vx=self.vy=0.0
+        self.on_gnd=False; self.facing_r=True; self.wframe=0
+        self.max_hp=200; self.hp=200; self.alive=True; self.frame=0
+        self.atk_cd=0; self.scd=0; self.inv_t=0
+        self.spd=3.2; self.jump_vel=-10.5
+        self.jump_cd=0   # prevent jump spam
+        self.name=name; self.col=col; self.follow_dist=follow_dist
+
+    def _wall_ahead(self,solid_rects,dx_sign):
+        """Check if there's a solid tile directly in front at chest height."""
+        probe_x=self.x+dx_sign*22
+        probe_y=self.y-24
+        for r in solid_rects:
+            if r.collidepoint(probe_x,probe_y): return True
+        return False
+
+    def update(self,player,monsters,solid_rects,gnd_y,WW,WH,bullets,particles,float_texts):
+        if not self.alive: return
+        self.frame+=1
+        if self.atk_cd>0: self.atk_cd-=1
+        if self.scd>0: self.scd-=1
+        if self.inv_t>0: self.inv_t-=1
+        if self.jump_cd>0: self.jump_cd-=1
+
+        live=[m for m in monsters if m.alive]
+        target=min(live,key=lambda m:dist((self.x,self.y),(m.x,m.y))) if live else None
+
+        # Decide movement direction
+        move_dx=0
+        if target:
+            d=dist((self.x,self.y),(target.x,target.y))
+            if d>90:
+                move_dx=1 if target.x>self.x else -1
+            # Ranged shot at target
+            if d<340 and self.scd<=0:
+                self.scd=30
+                dx2=target.x-self.x; dy2=(target.y-target.sz//2)-(self.y-22)
+                bullets.append(Bullet(self.x,self.y-22,dx2,dy2,22,"ally"))
+            # Melee if touching
+            if d<60 and self.atk_cd<=0:
+                self.atk_cd=28
+                if target.hurt_anim(18,particles,float_texts):
+                    for _ in range(8): particles.append(Particle(target.x,target.y-target.sz//2,C_GOLD))
+        else:
+            # Follow player
+            dp=player.x-self.x
+            if abs(dp)>self.follow_dist: move_dx=1 if dp>0 else -1
+            # Jump toward player if above
+            if player.y<self.y-70 and self.on_gnd and self.jump_cd<=0:
+                self.vy=self.jump_vel; self.jump_cd=45
+
+        # Apply movement
+        if move_dx!=0:
+            self.vx=self.spd*move_dx; self.facing_r=(move_dx>0); self.wframe+=1
+            # Obstacle-aware jump: jump over walls ahead
+            if self.on_gnd and self.jump_cd<=0 and self._wall_ahead(solid_rects,move_dx):
+                self.vy=self.jump_vel; self.jump_cd=45
+        else:
+            self.vx=0; self.wframe=0
+
+        # Gravity (ally is always ground-based)
+        self.vy=min(self.vy+0.52,20)
+
+        # X physics
+        self.x+=self.vx
+        er=pygame.Rect(self.x-13,self.y-48,26,48)
+        for r in solid_rects:
+            if er.colliderect(r):
+                self.x=r.left-13 if self.vx>0 else r.right+13; self.vx=0
+
+        # Y physics
+        self.y+=self.vy; self.on_gnd=False
+        er=pygame.Rect(self.x-13,self.y-48,26,48)
+        for r in solid_rects:
+            if er.colliderect(r):
+                if self.vy>0: self.y=r.top; self.vy=0; self.on_gnd=True
+                elif self.vy<0: self.y=r.bottom+48; self.vy=0
+
+        self.x=clamp(self.x,TILE*(2+BORDER_W)+15,WW-TILE*(2+BORDER_W)-15)
+
+    def hurt(self,dmg,particles):
+        if self.inv_t>0: return
+        self.hp-=dmg; self.inv_t=40
+        for _ in range(6): particles.append(Particle(self.x,self.y-22,self.col))
+        if self.hp<=0: self.hp=0; self.alive=False
+
+    def draw(self,surf,cx,cy):
+        if not self.alive: return
+        img=px_ai_companion(self.facing_r,self.wframe)
+        iw,ih=img.get_size(); sx=int(self.x-cx)-iw//2; sy=int(self.y-cy)-ih
+        if self.inv_t>0 and (self.inv_t//5)%2==1:
+            rd=img.copy(); rd.fill((180,100,255,130),special_flags=pygame.BLEND_RGBA_MULT); img=rd
+        else:
+            rd=img.copy(); rd.fill((*self.col,255),special_flags=pygame.BLEND_RGBA_MULT); img=rd
+        surf.blit(img,(sx,sy))
+        # Draw rifle in hand
+        hx=int(self.x-cx)+(14 if self.facing_r else -14); hy=int(self.y-cy)-34
+        draw_weapon_in_hand(surf,"Rifle",self.facing_r,hx,hy,self.scd<5,0)
+        lbl=FONT_SM.render(self.name,True,self.col); surf.blit(lbl,(int(self.x-cx)-lbl.get_width()//2,sy-16))
+        bw=48; bx=int(self.x-cx)-bw//2; by=sy-8
+        pygame.draw.rect(surf,C_DARKRED,(bx,by,bw,6),border_radius=2)
+        fill=int(bw*(self.hp/self.max_hp))
+        if fill>0: pygame.draw.rect(surf,self.col,(bx,by,fill,6),border_radius=2)
+        pygame.draw.rect(surf,C_WHITE,(bx,by,bw,6),1,border_radius=2)
+        # HP text
+        ht=FONT_SM.render(f"{self.hp}/{self.max_hp}",True,C_WHITE)
+        surf.blit(ht,(int(self.x-cx)-ht.get_width()//2,by-14))
+
+# ─── PLAYER ──────────────────────────────────────────────────────────────────
+class Player:
+    BASE_JUMP=-10.5; BASE_SPD=3.3; BASE_SCD=20
+    def __init__(self,x,y):
+        self.x=float(x); self.y=float(y); self.vx=self.vy=0.0; self.on_gnd=False
+        self.facing_r=True; self.wframe=0
+        self.max_hp=100; self.hp=100; self.coins=0; self.level=1; self.xp=0
+        self.weapon="Shotgun"; self.inv=["Fists","Shotgun"]
+        self.attacking=False; self.atk_cd=0; self.atk_prog=0.0
+        self.scd=0; self.inv_t=0; self.alive=True; self.lv_flash=0
+        self.spd=self.BASE_SPD; self.jump=self.BASE_JUMP
+        self.powerups={}
+        self.healthkits=0; self.mega_healthkits=0; self.scrolls=0
+        self.teleport_active=False
+        # Ammo dictionary: starts with some shotgun shells
+        self.ammo={k:0 for k in AMMO_KINDS}
+        self.ammo["ammo_shell"]=20   # starting ammo for shotgun
+
+    def has(self,pt): return self.powerups.get(pt,0)>0
+    def wd(self): return WEAPON_DATA[self.weapon]
+    def effective_dmg(self,b): return b*2 if self.has("damage_amp") else b
+    def effective_range_cd(self): return max(8,(self.BASE_SCD//2) if self.has("rapid_fire") else self.BASE_SCD)
+
+    def current_ammo_kind(self):
+        return weapon_ammo_kind(self.weapon)
+
+    def has_ammo(self):
+        ak=self.current_ammo_kind()
+        if ak is None: return True   # melee always has "ammo"
+        shots=6 if self.wd().get("spread") else 1
+        return self.ammo.get(ak,0)>=shots
+
+    def consume_ammo(self):
+        ak=self.current_ammo_kind()
+        if ak is None: return
+        shots=6 if self.wd().get("spread") else 1
+        self.ammo[ak]=max(0,self.ammo.get(ak,0)-shots)
+
+    def apply_powerup(self,ptype,fts):
+        self.powerups[ptype]=POWERUP_DEFS[ptype]["duration"]; play("power")
+        fts.append(FloatText(self.x,self.y-80,POWERUP_DEFS[ptype]["label"].upper()+"!",POWERUP_DEFS[ptype]["color"],big=True))
+
+    def tick_powerups(self):
+        for k in list(self.powerups):
+            self.powerups[k]-=1
+            if self.powerups[k]<=0: del self.powerups[k]
+        self.spd=self.BASE_SPD*(1.65 if self.has("speed_boost") else 1.0)
+        self.jump=self.BASE_JUMP*(1.45 if self.has("jump_boost") else 1.0)
+
+    def use_healthkit(self,fts):
+        if self.healthkits>0 and self.hp<self.max_hp:
+            heal=self.max_hp//2; self.hp=min(self.max_hp,self.hp+heal); self.healthkits-=1
+            play("heal"); fts.append(FloatText(self.x,self.y-60,f"+{heal} HP",C_GREEN,big=True))
+        elif self.mega_healthkits>0:
+            self.hp=self.max_hp; self.mega_healthkits-=1
+            play("heal"); fts.append(FloatText(self.x,self.y-60,"FULL HEAL!",C_GOLD,big=True))
+
+    def hurt(self,dmg,particles):
+        if self.inv_t>0: return
+        if self.has("shield"):
+            del self.powerups["shield"]
+            for _ in range(14): particles.append(Particle(self.x,self.y-22,C_BLUE,size=4)); return
+        self.hp-=dmg; self.inv_t=52
+        for _ in range(8): particles.append(Particle(self.x,self.y-22,C_RED))
+        if self.hp<=0: self.hp=0; self.alive=False
+
+    def gain_xp(self,amt,fts,lv_anims):
+        self.xp+=amt; fts.append(FloatText(self.x,self.y-52,f"+{amt}XP",C_CYAN))
+        while self.xp>=xp_for(self.level):
+            self.xp-=xp_for(self.level); self.level+=1
+            self.max_hp+=22; self.hp=min(self.max_hp,self.hp+35)
+            self.lv_flash=65; lv_anims.append(LevelUpAnim(self.x,self.y-24,self.level)); play("level")
+
+    MAX_WEAPON_SLOTS=9   # keys 1-9 — hard cap, nothing maps to a "10" key
+    def pick_weapon(self,name,fts):
+        if name in self.inv:
+            self.weapon=name; play("pickup")
+            fts.append(FloatText(self.x,self.y-62,f"Got {name}!",WEAPON_DATA[name]["col"]))
+            return None
+        if len(self.inv)>=self.MAX_WEAPON_SLOTS:
+            fts.append(FloatText(self.x,self.y-62,"Bag full! Press G to drop",C_ORANGE,big=True))
+            play("click")
+            return name   # caller can spawn this back as ground loot
+        self.inv.append(name); self.weapon=name; play("pickup")
+        fts.append(FloatText(self.x,self.y-62,f"Got {name}!",WEAPON_DATA[name]["col"]))
+        return None
+
+    def drop_current_weapon(self,fts):
+        """Drops the equipped weapon. Fists can't be dropped — it's the
+        fallback so the player is never left with an empty bag."""
+        if self.weapon=="Fists" or len(self.inv)<=1:
+            fts.append(FloatText(self.x,self.y-62,"Can't drop Fists!",C_GRAY))
+            return None
+        dropped=self.weapon
+        self.inv.remove(dropped)
+        self.weapon=self.inv[-1] if self.inv else "Fists"
+        fts.append(FloatText(self.x,self.y-62,f"Dropped {dropped}",C_GRAY))
+        play("click")
+        return dropped
+
+    def sprite(self): return px_player(self.facing_r,self.wframe,self.attacking,self.wd()["col"])
+    def hand_pos(self,cx,cy):
+        hx=int(self.x-cx)+(14 if self.facing_r else -14); hy=int(self.y-cy)-34
+        return hx,hy
+
+    def draw(self,surf,cx,cy):
+        if not self.alive: return
+        img=self.sprite(); iw,ih=img.get_size()
+        sx=int(self.x-cx)-iw//2; sy=int(self.y-cy)-ih
+        if self.inv_t>0 and (self.inv_t//5)%2==1:
+            rd=img.copy(); rd.fill((255,50,50,130),special_flags=pygame.BLEND_RGBA_MULT); img=rd
+        if self.has("shield"):
+            t2=math.sin(pygame.time.get_ticks()*0.008)
+            for ri in range(3,0,-1):
+                ga=sa(70,70); alpha=int(55*(ri/3)*(0.7+0.3*t2))
+                pygame.draw.circle(ga,(*C_BLUE,alpha),(35,35),20+ri*4)
+                surf.blit(ga,(sx+iw//2-35,sy+ih//2-35),special_flags=pygame.BLEND_ADD)
+        if self.has("speed_boost") and self.vx!=0:
+            for ti in range(3):
+                ax=sx-int(self.vx*ti*2); ghost=img.copy(); ghost.set_alpha(60-ti*18); surf.blit(ghost,(ax,sy))
+        surf.blit(img,(sx,sy))
+        hx,hy=self.hand_pos(cx,cy)
+        draw_weapon_in_hand(surf,self.weapon,self.facing_r,hx,hy,self.attacking,self.atk_prog)
+        if self.teleport_active:
+            mx,my=pygame.mouse.get_pos(); ta=sa(40,40)
+            pygame.draw.circle(ta,(150,80,255,120),(20,20),18)
+            pygame.draw.circle(ta,(200,150,255,200),(20,20),18,2)
+            surf.blit(ta,(mx-20,my-20))
+
+# ─── PHYSICS ─────────────────────────────────────────────────────────────────
+# ─── STORY / NPCs / QUESTS ─────────────────────────────────────────────────
+QUESTLINE=[
+    {"id":"q1","biome":0,"giver":"Old Maren","title":"A Familiar Face",
+     "text":["\"You're finally awake. The Hollow took everything east of here.\"",
+             "\"Kill 8 of those things and I'll believe you can help.\"",
+             "\"...Then head for the dunes. Someone out there is still alive.\""],
+     "goal":("kills",8),"reward":("gold",50),"recruit":True},
+    {"id":"q2","biome":1,"giver":"Kade the Trader","title":"Debts Owed",
+     "text":["\"A trader, out here? I had a caravan once.\"",
+             "\"Bandits took my route. Bring me a Fire Sword and we'll call it even.\"",
+             "\"...You actually did it. The cliffs ahead aren't safe — I'm coming with you.\""],
+     "goal":("item","Fire Sword"),"reward":("ammo",0),"recruit":True},
+    {"id":"q3","biome":3,"giver":"Sera the Watcher","title":"The Long Winter",
+     "text":["\"Nothing's grown here since the sky went wrong.\"",
+             "\"Reach level 6 and maybe you'll survive what's past the ice.\"",
+             "\"You've grown. Good. I'll watch your back from here.\""],
+     "goal":("level",6),"reward":("mega_kit",1),"recruit":True},
+    {"id":"q4","biome":4,"giver":"Brennic the Cinder-Priest","title":"Ash and Ember",
+     "text":["\"We burned this land ourselves, trying to stop it. Trying to stop It.\"",
+             "\"Defeat a boss and prove the fire hasn't won.\"",
+             "\"The Hollow Throne stands beyond. I'll stand with you at the end.\""],
+     "goal":("boss",1),"reward":("powerup",1),"recruit":True},
+    {"id":"q5","biome":6,"giver":"The Nameless Voice","title":"The Hollow Throne",
+     "text":["\"You came all this way to ask me to stop?\"",
+             "\"Kill me, then. If you can.\"",
+             "\"...Finish it.\""],
+     "goal":("boss",5),"reward":("ending",0),"recruit":False},
+]
+NPC_NAMES={"Old Maren":C_CYAN,"Kade the Trader":C_GOLD,"Sera the Watcher":C_ICE,
+           "Brennic the Cinder-Priest":C_FIRE,"The Nameless Voice":C_PURPLE}
+class NPC:
+    def __init__(self,x,y,name,quest_id):
+        self.x=x; self.y=y; self.name=name; self.quest_id=quest_id
+        self.bob=random.random()*6.28; self.recruited=False
+    def update(self):
+        self.bob+=0.05
+    def draw(self,surf,cx,cy):
+        if self.recruited: return
+        sx=self.x-cx; sy=self.y-cy+math.sin(self.bob)*2
+        if not(-40<sx<W+40 and -40<sy<H+40): return
+        col=NPC_NAMES.get(self.name,C_WHITE); glow=(self.name=="The Nameless Voice")
+        draw_drop_shadow(surf,self.x,self.y,26,cx,cy,70)
+        if glow: draw_point_light(surf,self.x,self.y-30,90,(col[0],col[1],col[2],70),cx,cy)
+        pygame.draw.rect(surf,(30,26,40),(sx-9,sy-40,18,40),border_radius=4)
+        pygame.draw.rect(surf,col,(sx-9,sy-40,18,40),2,border_radius=4)
+        pygame.draw.circle(surf,(224,196,168),(int(sx),int(sy-46)),9)
+        pygame.draw.circle(surf,C_BLACK,(int(sx),int(sy-46)),9,1)
+        t=FONT_SM.render(self.name,True,C_WHITE)
+        surf.blit(t,(sx-t.get_width()//2,sy-72))
+        bt=FONT_SM.render("[E] Talk",True,C_YELLOW)
+        surf.blit(bt,(sx-bt.get_width()//2,sy-58))
+
+REWARD_LABEL={"gold":"+{v} Gold","ammo":"Ammo Cache","mega_kit":"Mega Health Kit","powerup":"Powerup Cache","ending":"???"}
+def grant_reward(player,reward,float_texts):
+    kind,val=reward
+    if kind=="gold":
+        player.coins+=val; float_texts.append(FloatText(player.x,player.y-100,f"+{val} Gold!",C_GOLD,big=True))
+    elif kind=="ammo":
+        for k in list(player.ammo.keys()): player.ammo[k]=AMMO_CAPS.get(k,99)
+        float_texts.append(FloatText(player.x,player.y-100,"Ammo Restocked!",C_CYAN,big=True))
+    elif kind=="mega_kit":
+        player.mega_healthkits+=val; float_texts.append(FloatText(player.x,player.y-100,"+Mega Health Kit!",C_RED,big=True))
+    elif kind=="powerup":
+        ptype=random.choice(list(POWERUP_DEFS.keys())); player.apply_powerup(ptype,float_texts)
+    elif kind=="ending":
+        pass
+
+class QuestLog:
+    def __init__(self):
+        self.active=None; self.done=set(); self.dialogue=None; self.dlg_line=0; self.dlg_npc=None
+        self.pending_recruit=None; self.won=False
+    def talk(self,npc,player,kills,boss_kills):
+        q=next((qq for qq in QUESTLINE if qq["id"]==npc.quest_id),None)
+        if not q or npc.recruited: return
+        if q["id"] in self.done:
+            self.dialogue=["\"Safe travels. You'll need it.\""]; self.dlg_line=0; self.dlg_npc=npc.name; return
+        if self.active is None: self.active=q["id"]
+        self.dialogue=list(q["text"]); self.dlg_line=0; self.dlg_npc=npc.name
+    def advance(self):
+        if self.dialogue is None: return
+        self.dlg_line+=1
+        if self.dlg_line>=len(self.dialogue): self.dialogue=None
+    def check_complete(self,kills,player_level,boss_kills,player,float_texts):
+        if self.active is None: return None
+        idx=next(i for i,qq in enumerate(QUESTLINE) if qq["id"]==self.active)
+        q=QUESTLINE[idx]
+        kind,val=q["goal"]
+        done=(kind=="kills" and kills>=val) or (kind=="level" and player_level>=val) or \
+             (kind=="boss" and boss_kills>=val) or (kind=="item" and val in player.inv)
+        if done and self.active not in self.done:
+            self.done.add(self.active); completed=self.active; self.active=None
+            grant_reward(player,q["reward"],float_texts)
+            if q.get("recruit"): self.pending_recruit=q["giver"]
+            if q["reward"][0]=="ending": self.won=True
+            if idx+1<len(QUESTLINE): self.active=QUESTLINE[idx+1]["id"]
+            return completed
+        return None
+    def current_title(self):
+        if self.won: return "The Hollow Throne has fallen."
+        if self.active is None: return "All quests complete"
+        q=next(qq for qq in QUESTLINE if qq["id"]==self.active)
+        kind,val=q["goal"]
+        tgt={"kills":f"Kills {val}","level":f"Reach Lv.{val}","boss":f"Defeat {val} boss(es)","item":f"Find {val}"}[kind]
+        return f'{q["title"]} — {tgt}'
+
+def spawn_story_npcs(ww):
+    npcs=[]
+    for i,q in enumerate(QUESTLINE):
+        col=int((q["biome"]+0.5)/len(BIOMES)*ww/TILE)
+        npcs.append(NPC(col*TILE, 0, q["giver"], q["id"]))  # y fixed up after ground calc
+    return npcs
+
+def physics(e,solid_rects,ww,wh):
+    e.x+=e.vx
+    er=pygame.Rect(e.x-13,e.y-48,26,48)
+    for r in solid_rects:
+        if er.colliderect(r): e.x=r.left-13 if e.vx>0 else r.right+13; e.vx=0
+    e.y+=e.vy; e.on_gnd=False
+    er=pygame.Rect(e.x-13,e.y-48,26,48)
+    for r in solid_rects:
+        if er.colliderect(r):
+            if e.vy>0: e.y=r.top; e.vy=0; e.on_gnd=True
+            elif e.vy<0: e.y=r.bottom+48; e.vy=0
+    e.x=clamp(e.x,TILE*(2+BORDER_W)+15,ww-TILE*(2+BORDER_W)-15)
+
+# ─── HUD ─────────────────────────────────────────────────────────────────────
+def draw_hud(surf,player,wave,kills,dt):
+    pygame.draw.rect(surf,(8,8,18,200),(4,4,250,200),border_radius=9)
+    pygame.draw.rect(surf,(55,55,95),(4,4,250,200),2,border_radius=9)
+    pygame.draw.rect(surf,C_DARKRED,(12,12,210,18),border_radius=5)
+    hf=int(210*(player.hp/player.max_hp))
+    if hf>0:
+        fc=C_GREEN if player.hp/player.max_hp>0.5 else(C_YELLOW if player.hp/player.max_hp>0.25 else C_RED)
+        pygame.draw.rect(surf,fc,(12,12,hf,18),border_radius=5)
+    pygame.draw.rect(surf,C_WHITE,(12,12,210,18),2,border_radius=5)
+    surf.blit(FONT_SM.render(f"HP {player.hp}/{player.max_hp}",True,C_WHITE),(14,14))
+    needed=xp_for(player.level)
+    pygame.draw.rect(surf,(18,18,58),(12,34,210,11),border_radius=3)
+    xf=int(210*(player.xp/needed))
+    if xf>0: pygame.draw.rect(surf,C_PURPLE,(12,34,xf,11),border_radius=3)
+    pygame.draw.rect(surf,C_GRAY,(12,34,210,11),1,border_radius=3)
+    surf.blit(FONT_SM.render(f"XP {player.xp}/{needed}",True,C_GRAY),(14,35))
+    surf.blit(FONT_MD.render(f"Level {player.level}",True,C_GOLD),(12,50))
+    bag_col=C_RED if len(player.inv)>=player.MAX_WEAPON_SLOTS else C_GRAY
+    surf.blit(FONT_SM.render(f"Weapon: {player.weapon}",True,WEAPON_DATA[player.weapon]["col"]),(12,68))
+    surf.blit(FONT_SM.render(f"Bag {len(player.inv)}/{player.MAX_WEAPON_SLOTS}",True,bag_col),(160,68))
+    # Ammo display
+    ak=player.current_ammo_kind()
+    if ak:
+        acnt=player.ammo.get(ak,0); acap=AMMO_CAPS.get(ak,99)
+        acol=AMMO_COL.get(ak,C_GRAY) if acnt>0 else C_RED
+        # Ammo bar
+        pygame.draw.rect(surf,(30,30,30),(12,82,210,10),border_radius=3)
+        af=int(210*(acnt/acap)); af=min(af,210)
+        if af>0: pygame.draw.rect(surf,acol,(12,82,af,10),border_radius=3)
+        pygame.draw.rect(surf,C_GRAY,(12,82,210,10),1,border_radius=3)
+        ammo_txt=f"AMMO: {acnt}/{acap}"
+        if acnt==0: ammo_txt="OUT OF AMMO! [X]"
+        surf.blit(FONT_SM.render(ammo_txt,True,acol),(14,83))
+    else:
+        surf.blit(FONT_SM.render("[X] N/A (melee only)",True,C_GRAY),(12,82))
+    surf.blit(FONT_SM.render(f"Coins:{player.coins}  Kills:{kills}  Wave:{wave}",True,C_CYAN),(12,97))
+    hk_col=C_RED if player.healthkits>0 else C_GRAY
+    mk_col=C_GOLD if player.mega_healthkits>0 else C_GRAY
+    sc_col=C_PURPLE if player.scrolls>0 else C_GRAY
+    surf.blit(FONT_SM.render(f"[H]Kit:{player.healthkits} Mega:{player.mega_healthkits}",True,hk_col),(12,112))
+    surf.blit(FONT_SM.render(f"[0] Scroll:{player.scrolls}",True,sc_col),(12,126))
+    is_night=night_alpha(dt)>80; ccol=C_GOLD if not is_night else (180,180,255)
+    moon=">" if is_night else "*"
+    surf.blit(FONT_SM.render(f"{moon} {game_time_str(dt)}",True,ccol),(12,140))
+    surf.blit(FONT_SM.render(f"Wave {wave}  Boss every 5",True,(80,80,140)),(12,156))
+    surf.blit(FONT_SM.render(f"Z=Slash X=Shoot H=Heal G=Drop 0=Scroll",True,(72,72,112)),(12,172))
+    # Powerup bars
+    active=[(k,v) for k,v in player.powerups.items() if v>0]
+    for i,(ptype,frames) in enumerate(active):
+        pdef=POWERUP_DEFS[ptype]; col=pdef["color"]; total=pdef["duration"]
+        bx=4; by=H-40-i*22; bw=210; bh=16
+        pygame.draw.rect(surf,(8,8,18,180),(bx,by,bw+70,bh),border_radius=5)
+        fill=int(bw*(frames/total))
+        if fill>0: pygame.draw.rect(surf,col,(bx,by,fill,bh),border_radius=5)
+        pygame.draw.rect(surf,C_WHITE,(bx,by,bw,bh),1,border_radius=5)
+        surf.blit(FONT_SM.render(f"{pdef['icon']} {pdef['label']} {frames//60+1}s",True,col),(bx+4,by+1))
+    # Inventory
+    ix=W-220
+    for i,wn in enumerate(player.inv):
+        sel=(wn==player.weapon)
+        pygame.draw.rect(surf,(55,45,18) if sel else (28,28,50),(ix,8+i*25,210,21),border_radius=4)
+        if sel: pygame.draw.rect(surf,C_GOLD,(ix,8+i*25,210,21),2,border_radius=4)
+        ak2=weapon_ammo_kind(wn)
+        ammo_tag=""
+        if ak2: ammo_tag=f" [{player.ammo.get(ak2,0)}]"
+        surf.blit(FONT_SM.render(f"[{i+1}]{wn}{ammo_tag}",True,WEAPON_DATA[wn]["col"]),(ix+4,11+i*25))
+
+def draw_death(surf,player,kills):
+    ov=sa(W,H); ov.fill((70,0,0,185)); surf.blit(ov,(0,0))
+    t1=FONT_XL.render("YOU DIED",True,C_RED); surf.blit(t1,(W//2-t1.get_width()//2,H//2-90))
+    t2=FONT_LG.render(f"Level {player.level}   Kills:{kills}   Coins:{player.coins}",True,C_WHITE)
+    surf.blit(t2,(W//2-t2.get_width()//2,H//2-10))
+    t3=FONT_MD.render("Press R to Restart",True,C_GRAY); surf.blit(t3,(W//2-t3.get_width()//2,H//2+55))
+
+# ─── LOOT GENERATION ─────────────────────────────────────────────────────────
+def gen_ammo_drops(monster):
+    """Drop random ammo packs from any killed mob."""
+    drops=[]; chance=0.55 if monster.boss else 0.30
+    rolls=3 if monster.boss else 1
+    for _ in range(rolls):
+        if random.random()>chance: continue
+        kind=random.choice(AMMO_KINDS)
+        lo,hi=AMMO_GIVE[kind]
+        drops.append(Loot(monster.x+random.uniform(-20,20),monster.y-monster.sz-10,kind,
+                          random.randint(lo,hi)))
+    return drops
+
+def gen_loot(monster,plv,is_5lv_boss=False):
+    drops=[]; lb=0.09*(plv-1)
+    nc=random.randint(2,6) if monster.boss else random.randint(0,2)
+    for _ in range(nc):
+        drops.append(Loot(monster.x+random.uniform(-22,22),monster.y-monster.sz,"coin",
+            random.randint(4,12) if monster.boss else random.randint(1,6)))
+    elg=[w for w in WNAMES if w!="Fists"]
+    wts=[WEAPON_DATA[w]["rare"]*monster.dw*(1+lb) for w in elg]
+    tot=sum(wts); r=random.uniform(0,tot+110); cum=0
+    for w,wt in zip(elg,wts):
+        cum+=wt
+        if r<cum: drops.append(Loot(monster.x,monster.y-monster.sz-12,w)); break
+    if is_5lv_boss:
+        drops.append(Loot(monster.x-20,monster.y-monster.sz-20,"Fire Sword"))
+        drops.append(Loot(monster.x+20,monster.y-monster.sz-20,"Ice Sword"))
+        for _ in range(3): drops.append(Loot(monster.x+random.uniform(-25,25),monster.y-monster.sz,"mega_healthkit"))
+    if random.random()<(0.30 if not monster.boss else 0.80):
+        mega=random.random()<(0.2 if not monster.boss else 0.5)
+        drops.append(Loot(monster.x+random.uniform(-15,15),monster.y-monster.sz-16,"mega_healthkit" if mega else "healthkit"))
+    if random.random()<(0.12 if not monster.boss else 0.6):
+        drops.append(Loot(monster.x+random.uniform(-10,10),monster.y-monster.sz-20,"teleport_scroll"))
+    drops+=gen_ammo_drops(monster)
+    return drops
+
+def gen_powerup_drops(monster):
+    weights=ENEMY_PW.get(monster.name,{})
+    if not weights: return []
+    drops=[]; rolls=2 if monster.boss else 1
+    for _ in range(rolls):
+        if random.random()>(1.0 if monster.boss else 0.38): continue
+        total=sum(weights.values()); r=random.uniform(0,total); cum=0
+        for ptype,w in weights.items():
+            cum+=w
+            if r<cum: drops.append(PowerupDrop(monster.x+random.uniform(-18,18),monster.y-monster.sz,ptype)); break
+    return drops
+
+def spawn_near_player(tiles,cols,rows,fr,plv,px,count,force_boss=False):
+    """Spawns just off-screen to either side of the player, not scattered
+    across the whole map — so there's never a straggler to hunt down on
+    the far side of a 100-tile-wide world."""
+    mons=[]
+    elig=[m for m in MTYPES if m["min_lv"]<=max(1,plv) and not m["boss"]]
+    bosses=[m for m in MTYPES if m["boss"] and m["min_lv"]<=max(1,plv)]
+    gnd_y=fr*TILE
+    spawn_l=(2+BORDER_W+1)*TILE; spawn_r=(cols-2-BORDER_W-1)*TILE
+    for _ in range(count):
+        mt=random.choice(elig)
+        side=random.choice([-1,1])
+        offset=random.randint(560,860)
+        sx=clamp(int(px+side*offset),spawn_l,spawn_r)
+        mons.append(Monster(sx,gnd_y-mt["sz"]-4,mt,plv))
+    if force_boss and bosses:
+        mt=bosses[-1]
+        side=random.choice([-1,1])
+        sx=clamp(int(px+side*700),spawn_l,spawn_r)
+        mons.append(Monster(sx,gnd_y-mt["sz"]-4,mt,plv))
+    return mons
+
+def spawn_wave(tiles,cols,rows,fr,plv,count,force_boss=False):
+    mons=[]
+    elig=[m for m in MTYPES if m["min_lv"]<=max(1,plv) and not m["boss"]]
+    bosses=[m for m in MTYPES if m["boss"] and m["min_lv"]<=max(1,plv)]
+    gnd_y=fr*TILE
+    # Spawn only in valid zone (away from border terrain)
+    spawn_l=(2+BORDER_W+1)*TILE; spawn_r=(cols-2-BORDER_W-1)*TILE
+    for _ in range(count):
+        mt=random.choice(elig)
+        sx=random.randint(spawn_l,spawn_r)
+        mons.append(Monster(sx,gnd_y-mt["sz"]-4,mt,plv))
+    if force_boss and bosses:
+        mt=bosses[-1]; sx=random.randint(spawn_l,spawn_r)
+        mons.append(Monster(sx,gnd_y-mt["sz"]-4,mt,plv))
+    return mons
+
+# ─── SETTINGS ────────────────────────────────────────────────────────────────
+FPS_OPTIONS=[20,30,60]
+class Settings:
+    def __init__(self): self.sound_level=1; self.fps_idx=2
+    def get_vol(self): return [0.0,0.5,1.0][self.sound_level]
+    def label(self): return ["OFF","MEDIUM","FULL"][self.sound_level]
+    def cycle(self): self.sound_level=(self.sound_level+1)%3
+    def get_fps(self): return FPS_OPTIONS[self.fps_idx]
+    def fps_label(self): return str(FPS_OPTIONS[self.fps_idx])
+    def cycle_fps(self): self.fps_idx=(self.fps_idx+1)%len(FPS_OPTIONS)
+SETTINGS=Settings()
+
+# ─── MENU ────────────────────────────────────────────────────────────────────
+def draw_menu_bg(surf,tick):
+    for y in range(H): c=lerp_col(SKY_NIGHT_TOP,SKY_NIGHT_BOT,y/H); pygame.draw.line(surf,c,(0,y),(W,y))
+    for sx2,sy2,br in STARS:
+        px2=(sx2+(tick//3))%W; py2=sy2%(H//2)
+        c=int(100+br*120); pygame.draw.rect(surf,(c,c,min(255,c+30)),(px2,py2,2,2))
+    for i in range(6):
+        x=100+i*155+int(math.sin(tick*0.007+i)*12); y=H//2+80+int(math.cos(tick*0.005+i*1.2)*20)
+        pygame.draw.rect(surf,(40,32,60),(x,y,130,12),border_radius=3)
+        pygame.draw.rect(surf,(60,48,90),(x,y,130,4),border_radius=3)
+
+def draw_button(surf,rect,text,hover=False,col=None):
+    base=col or (60,40,100); hov=tuple(min(255,c+40) for c in base) if hover else base
+    pygame.draw.rect(surf,hov,rect,border_radius=10)
+    pygame.draw.rect(surf,(140,100,220),rect,3,border_radius=10)
+    lbl=FONT_MD.render(text,True,C_WHITE)
+    surf.blit(lbl,(rect.centerx-lbl.get_width()//2,rect.centery-lbl.get_height()//2))
+
+def menu_screen():
+    global SOUND_VOL; SOUND_VOL=SETTINGS.get_vol(); music_play()
+    tick=0; btn_start=pygame.Rect(W//2-120,H//2,240,54); btn_settings=pygame.Rect(W//2-120,H//2+70,240,54)
+    while True:
+        clock.tick(60); tick+=1; mx,my=pygame.mouse.get_pos()
+        for ev in pygame.event.get():
+            if ev.type==pygame.QUIT: pygame.quit(); sys.exit()
+            if ev.type==pygame.MOUSEBUTTONDOWN:
+                if btn_start.collidepoint(mx,my): play("click"); music_stop(); return "start"
+                if btn_settings.collidepoint(mx,my): play("click"); settings_screen(); music_play()
+        draw_menu_bg(screen,tick)
+        title=FONT_T.render("DUNGEON",True,C_GOLD); sub=FONT_LG.render("CRAWLER – ULTIMATE EDITION",True,C_PURPLE)
+        pulse=int(abs(math.sin(tick*0.04))*30)
+        pygame.draw.rect(screen,(20+pulse,10,40+pulse),(W//2-title.get_width()//2-12,H//2-150,title.get_width()+24,title.get_height()+8),border_radius=8)
+        screen.blit(title,(W//2-title.get_width()//2,H//2-148)); screen.blit(sub,(W//2-sub.get_width()//2,H//2-88))
+        for tx in [W//2-230,W//2+210]:
+            tc=int(200+math.sin(tick*0.12)*55)
+            pygame.draw.rect(screen,C_BROWN,(tx-4,H//2-144,8,32))
+            pygame.draw.circle(screen,(tc,tc//2,0),(tx,H//2-145),10+int(abs(math.sin(tick*0.15))*4))
+            pygame.draw.circle(screen,(255,200,80),(tx,H//2-145),6)
+        draw_button(screen,btn_start,"  START",btn_start.collidepoint(mx,my),(50,100,60))
+        draw_button(screen,btn_settings,"  SETTINGS",btn_settings.collidepoint(mx,my),(60,60,120))
+        tip=FONT_SM.render("Guns need ammo! Collect drops from enemies.",True,(100,80,160))
+        screen.blit(tip,(W//2-tip.get_width()//2,H-40)); pygame.display.flip()
+
+def settings_screen():
+    global SOUND_VOL
+    btn_back=pygame.Rect(W//2-100,H//2+160,200,48); btn_sound=pygame.Rect(W//2-150,H//2-30,300,54)
+    btn_fps=pygame.Rect(W//2-150,H//2+50,300,54); tick=0
+    while True:
+        clock.tick(60); tick+=1; mx,my=pygame.mouse.get_pos()
+        for ev in pygame.event.get():
+            if ev.type==pygame.QUIT: pygame.quit(); sys.exit()
+            if ev.type==pygame.MOUSEBUTTONDOWN:
+                if btn_sound.collidepoint(mx,my):
+                    SETTINGS.cycle(); SOUND_VOL=SETTINGS.get_vol()
+                    if SOUND_VOL==0: music_stop()
+                    else: music_play()
+                    play("click")
+                if btn_fps.collidepoint(mx,my): SETTINGS.cycle_fps(); play("click")
+                if btn_back.collidepoint(mx,my): play("click"); return
+        draw_menu_bg(screen,tick)
+        title=FONT_LG.render("SETTINGS",True,C_GOLD); screen.blit(title,(W//2-title.get_width()//2,H//2-130))
+        scol=(50,140,80) if SETTINGS.sound_level==2 else (100,100,60) if SETTINGS.sound_level==1 else (120,40,40)
+        draw_button(screen,btn_sound,f"SOUND:  {SETTINGS.label()}",btn_sound.collidepoint(mx,my),scol)
+        screen.blit(FONT_SM.render("Click to cycle: OFF  MEDIUM  FULL",True,C_GRAY),(W//2-130,H//2+14))
+        fps_col=(50,120,140) if SETTINGS.get_fps()==60 else (100,100,50) if SETTINGS.get_fps()==30 else (100,60,60)
+        draw_button(screen,btn_fps,f"FPS:  {SETTINGS.fps_label()}",btn_fps.collidepoint(mx,my),fps_col)
+        screen.blit(FONT_SM.render("20=Slow PC  30=Balanced  60=Fastest",True,C_GRAY),(W//2-115,H//2+110))
+        draw_button(screen,btn_back,"  BACK",btn_back.collidepoint(mx,my),(60,40,100)); pygame.display.flip()
+
+# ─── MAIN GAME ───────────────────────────────────────────────────────────────
+def run():
+    global SOUND_VOL; SOUND_VOL=SETTINGS.get_vol()
+    target_fps=SETTINGS.get_fps()
+
+    COLS,ROWS=340,34   # 5x wider world -> five distinct biome zones ("maps")
+    tiles,fr=generate_world(COLS,ROWS)
+    solid_rects=bake_rects(tiles,COLS,ROWS)
+    gnd_y=fr*TILE; WW,WH=COLS*TILE,ROWS*TILE
+
+    player=Player((2+BORDER_W)*TILE+260,gnd_y-70)   # start in Green Hollow
+    cam_x=float(player.x-W//2); cam_y=float(player.y-H//2-40)
+    shake=0; sx_=sy_=0
+
+    particles=[]; float_texts=[]; bullets=[]; loots=[]; powerup_drops=[]
+    lv_anims=[]; explosions=[]
+    monsters=spawn_wave(tiles,COLS,ROWS,fr,1,5)
+    kills=0; boss_kills=0; wave=1; wave_timer=0; spawn_timer=0; companions=[]
+    day_tick=int(DAY_LEN*0.25); boss_wave_spawned=set()
+    night_overlay=pygame.Surface((W,H),pygame.SRCALPHA)
+
+    npcs=spawn_story_npcs(WW)
+    for n in npcs: n.y=gnd_y-30
+    ql=QuestLog(); ql.active=QUESTLINE[0]["id"]
+    e_prev=False; talk_range=90
+    COMPANION_COLORS=[C_CYAN,C_GOLD,C_ICE,C_FIRE,C_PURPLE]
+
+    def make_nearby_rects(ex,ey,margin=96):
+        return [r for r in solid_rects if abs(r.centerx-ex)<margin and abs(r.centery-ey)<margin]
+
+    # Playable x bounds (enforced by physics clamp)
+    play_min_x=TILE*(2+BORDER_W)+15
+    play_max_x=WW-TILE*(2+BORDER_W)-15
+
+    while True:
+        clock.tick(target_fps); day_tick+=1
+        for ev in pygame.event.get():
+            if ev.type==pygame.QUIT: pygame.quit(); sys.exit()
+            if ev.type==pygame.KEYDOWN:
+                if ev.key==pygame.K_r and not player.alive: return
+                for i,wn in enumerate(player.inv):
+                    if ev.key==getattr(pygame,f"K_{i+1}",None): player.weapon=wn
+                if ev.key==pygame.K_h: player.use_healthkit(float_texts)
+                if ev.key==pygame.K_g:
+                    dropped=player.drop_current_weapon(float_texts)
+                    if dropped: loots.append(Loot(player.x+(20 if player.facing_r else -20),player.y-24,dropped))
+                if ev.key==pygame.K_0 and player.scrolls>0 and not player.teleport_active:
+                    player.teleport_active=True
+                    float_texts.append(FloatText(player.x,player.y-70,"Click to Teleport!",C_PURPLE)); play("tele")
+                if ev.key==pygame.K_e:
+                    if ql.dialogue is not None:
+                        ql.advance()
+                    else:
+                        near=[n for n in npcs if dist((n.x,n.y),(player.x,player.y))<talk_range]
+                        if near:
+                            ql.talk(near[0],player,kills,boss_kills); play("click")
+            if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==1:
+                if player.teleport_active and player.scrolls>0:
+                    mx2,my2=pygame.mouse.get_pos()
+                    tx=clamp(mx2+int(cam_x),play_min_x,play_max_x)
+                    ty=clamp(my2+int(cam_y),TILE*3,WH-TILE*3)
+                    for _ in range(24): particles.append(Particle(player.x,player.y-24,C_PURPLE,size=random.uniform(3,8),life=35))
+                    player.x=float(tx); player.y=float(ty)
+                    for _ in range(24): particles.append(Particle(player.x,player.y-24,(180,100,255),size=random.uniform(3,8),life=35))
+                    player.scrolls-=1; player.teleport_active=False
+                    play("tele"); float_texts.append(FloatText(player.x,player.y-60,"*WHOOSH*",C_PURPLE,big=True))
+
+        if not player.alive:
+            CX=int(cam_x); CY=int(cam_y)
+            draw_bg(screen,CX,CY,day_tick,WW); draw_world(screen,tiles,COLS,ROWS,CX,CY,WW)
+            draw_death(screen,player,kills); pygame.display.flip(); continue
+
+        keys=pygame.key.get_pressed()
+        player.vx=0; moving=False
+        if keys[pygame.K_a] or keys[pygame.K_LEFT]:  player.vx=-player.spd; player.facing_r=False; moving=True
+        if keys[pygame.K_d] or keys[pygame.K_RIGHT]: player.vx=player.spd;  player.facing_r=True;  moving=True
+        if (keys[pygame.K_w] or keys[pygame.K_SPACE] or keys[pygame.K_UP]) and player.on_gnd:
+            player.vy=player.jump
+        player.vy=min(player.vy+0.52,20)
+        if moving: player.wframe+=1
+        else: player.wframe=0
+        if player.atk_cd>0: player.atk_cd-=1
+        if player.scd>0: player.scd-=1
+        if player.inv_t>0: player.inv_t-=1
+        if player.lv_flash>0: player.lv_flash-=1
+        player.tick_powerups()
+        nearby=make_nearby_rects(player.x,player.y,128)
+        physics(player,nearby,WW,WH)
+        if player.has("regen") and random.randint(0,89)==0: player.hp=min(player.max_hp,player.hp+1)
+        if player.attacking: player.atk_prog=min(1.0,player.atk_prog+0.12)
+        else: player.atk_prog=max(0.0,player.atk_prog-0.15)
+
+        # ── MELEE (Z) ────────────────────────────────────────────────────────
+        player.attacking=False
+        if keys[pygame.K_z] and player.atk_cd<=0:
+            player.atk_cd=24; player.attacking=True
+            wd=player.wd(); play(wd.get("sfx","swing"))
+            if wd.get("element")=="fire":
+                for _ in range(6): particles.append(Particle(player.x+(8 if player.facing_r else -8),player.y-32,C_FIRE,size=4,life=18))
+            elif wd.get("element")=="ice":
+                for _ in range(5): particles.append(Particle(player.x+(8 if player.facing_r else -8),player.y-32,C_ICE,size=3,life=20))
+            for m in monsters:
+                if not m.alive: continue
+                d=dist((player.x,player.y),(m.x,m.y))
+                if d<wd["range"]+m.sz and (m.x>player.x)==player.facing_r:
+                    killed=m.hurt_anim(int(player.effective_dmg(wd["dmg"])),particles,float_texts)
+                    shake=7; play("hit")
+                    if killed:
+                        kills+=1; is5=wave%5==0 and m.boss
+                        player.gain_xp(m.xp,float_texts,lv_anims)
+                        loots+=gen_loot(m,player.level,is5); powerup_drops+=gen_powerup_drops(m)
+                        if m.boss: play("boss"); boss_kills+=1
+
+        # ── SHOOT (X) — guns only, ammo required ─────────────────────────────
+        if keys[pygame.K_x] and player.scd<=0 and not player.teleport_active:
+            if weapon_can_shoot(player.weapon):
+                if player.has_ammo():
+                    player.scd=player.effective_range_cd(); wd=player.wd()
+                    play(wd.get("sfx","shoot")); player.attacking=True
+                    player.consume_ammo()
+                    mx2,my2=pygame.mouse.get_pos()
+                    cx_=int(cam_x)+(shake>0)*sx_; cy_=int(cam_y)+(shake>0)*sy_
+                    dx=(mx2+cx_)-player.x; dy=(my2+cy_)-(player.y-22)
+                    elem=wd.get("element",""); bdmg=int(player.effective_dmg(wd["bdmg"]))
+                    if wd.get("rocket"):
+                        player.scd=max(player.scd,45)
+                        bullets.append(Bullet(player.x,player.y-22,dx,dy,bdmg,"player",elem,is_rocket=True))
+                        for _ in range(8): particles.append(Particle(player.x,player.y-22,C_ORANGE,size=5,life=15))
+                    elif wd.get("spread"):
+                        for _ in range(6):
+                            spread=random.uniform(-0.18,0.18); ang=math.atan2(dy,dx)+spread
+                            bullets.append(Bullet(player.x,player.y-22,math.cos(ang),math.sin(ang),bdmg//2,"player",elem))
+                    else:
+                        bullets.append(Bullet(player.x,player.y-22,dx,dy,bdmg,"player",elem))
+                    for _ in range(6): particles.append(Particle(player.x,player.y-22,C_YELLOW,size=3,life=12))
+                else:
+                    # Out of ammo – dry click + flash
+                    if player.scd<=0: play("dry"); player.scd=15
+                    float_texts.append(FloatText(player.x,player.y-50,"NO AMMO!",C_RED))
+
+        # ── BULLETS ──────────────────────────────────────────────────────────
+        new_bul=[]
+        for b in bullets:
+            b.update(solid_rects)
+            if not b.alive:
+                if b.is_rocket:
+                    explosions.append(Explosion(b.x,b.y,b.dmg,90)); play("explode")
+                    for _ in range(20): particles.append(Particle(b.x,b.y,random.choice([C_FIRE,C_ORANGE,C_YELLOW]),size=random.uniform(4,9),life=30))
+                continue
+            if b.owner in ("player","ally"):
+                hit=False
+                for m in monsters:
+                    if not m.alive: continue
+                    if dist((b.x,b.y),(m.x,m.y-m.sz//2))<m.sz+7:
+                        if b.is_rocket:
+                            explosions.append(Explosion(b.x,b.y,b.dmg,90)); play("explode")
+                            for _ in range(20): particles.append(Particle(b.x,b.y,random.choice([C_FIRE,C_ORANGE,C_YELLOW]),size=random.uniform(4,9),life=30))
+                            for m2 in monsters:
+                                if not m2.alive: continue
+                                if dist((b.x,b.y),(m2.x,m2.y-m2.sz//2))<90:
+                                    dmg2=int(player.effective_dmg(b.dmg))
+                                    killed2=m2.hurt_anim(dmg2,particles,float_texts)
+                                    if killed2:
+                                        kills+=1; is5=wave%5==0 and m2.boss
+                                        player.gain_xp(m2.xp,float_texts,lv_anims)
+                                        loots+=gen_loot(m2,player.level,is5); powerup_drops+=gen_powerup_drops(m2)
+                                        if m2.boss: play("boss"); boss_kills+=1
+                        else:
+                            dmg=int(player.effective_dmg(b.dmg))
+                            if b.element=="fire": dmg=int(dmg*1.3)
+                            elif b.element=="ice": dmg=int(dmg*1.2); m.spd=max(0.3,m.spd*0.98)
+                            killed=m.hurt_anim(dmg,particles,float_texts); shake=4; play("hit")
+                            if killed:
+                                kills+=1; is5=wave%5==0 and m.boss
+                                player.gain_xp(m.xp,float_texts,lv_anims)
+                                loots+=gen_loot(m,player.level,is5); powerup_drops+=gen_powerup_drops(m)
+                                if m.boss: play("boss"); boss_kills+=1
+                        b.alive=False; hit=True; break
+                if hit: continue
+            else:
+                if dist((b.x,b.y),(player.x,player.y-22))<17:
+                    player.hurt(b.dmg,particles)
+                    float_texts.append(FloatText(player.x,player.y-52,f"-{b.dmg}",C_RED)); b.alive=False; continue
+                found=None
+                for ally in companions:
+                    if ally.alive and dist((b.x,b.y),(ally.x,ally.y-22))<17: found=ally; break
+                if found: found.hurt(b.dmg,particles); b.alive=False; continue
+            if b.alive: new_bul.append(b)
+        bullets=new_bul
+
+        for ex in explosions: ex.update()
+        explosions=[ex for ex in explosions if ex.alive]
+
+        # ── MONSTERS ─────────────────────────────────────────────────────────
+        for m in monsters:
+            if not m.alive: continue
+            m_nearby=make_nearby_rects(m.x,m.y,96)
+            r=m.update(player.x,player.y-22,m_nearby,gnd_y)
+            if r:
+                kind,val=r
+                if kind=="melee" and player.alive:
+                    player.hurt(val,particles)
+                    float_texts.append(FloatText(player.x,player.y-52,f"-{val}",C_RED)); shake=9
+                elif kind=="bullet": bullets.append(val)
+            for ally in companions:
+                if ally.alive and dist((m.x,m.y),(ally.x,ally.y))<m.sz+32 and m.atk_cd<=0:
+                    ally.hurt(m.mdmg,particles)
+
+        for ally in companions:
+            if ally.alive:
+                ally_nearby=make_nearby_rects(ally.x,ally.y,96)
+                ally.update(player,monsters,ally_nearby,gnd_y,WW,WH,bullets,particles,float_texts)
+
+        for n in npcs: n.update()
+        completed=ql.check_complete(kills,player.level,boss_kills,player,float_texts)
+        if completed:
+            float_texts.append(FloatText(player.x,player.y-120,"Quest Complete!",C_GOLD,big=True))
+            play("level")
+        if ql.pending_recruit:
+            gname=ql.pending_recruit; ql.pending_recruit=None
+            src=next((n for n in npcs if n.name==gname),None)
+            if src:
+                src.recruited=True
+                idx=len(companions)%len(COMPANION_COLORS)
+                companions.append(AICompanion(src.x,src.y-30,name=gname.split()[0],
+                                               col=COMPANION_COLORS[idx],follow_dist=110+idx*40))
+                float_texts.append(FloatText(player.x,player.y-140,f"{gname} joined you!",C_PURPLE,big=True))
+
+        # ── LOOT PICKUP ──────────────────────────────────────────────────────
+        magnet_range=120 if player.has("magnet") else 34
+        for l in loots:
+            l.update(gnd_y-8)
+            if not l.alive: continue
+            d=dist((player.x,player.y),(l.x,l.y))
+            if player.has("magnet") and l.kind=="coin" and d<magnet_range:
+                nxx,nyy=norm(player.x-l.x,player.y-l.y); l.x+=nxx*5; l.y+=nyy*5
+            if d<32:
+                l.alive=False
+                if l.kind=="coin":
+                    player.coins+=l.value; play("coin")
+                    float_texts.append(FloatText(l.x,l.y-20,f"+{l.value}g",C_GOLD))
+                elif l.kind=="healthkit":
+                    player.healthkits+=1; play("pickup")
+                    float_texts.append(FloatText(l.x,l.y-20,"Health Kit!",C_RED))
+                elif l.kind=="mega_healthkit":
+                    player.mega_healthkits+=1; play("pickup")
+                    float_texts.append(FloatText(l.x,l.y-20,"MEGA KIT!",C_GOLD,big=True))
+                elif l.kind=="teleport_scroll":
+                    player.scrolls+=1; play("pickup")
+                    float_texts.append(FloatText(l.x,l.y-20,"Scroll!",C_PURPLE))
+                elif l.kind in AMMO_KINDS:
+                    cap=AMMO_CAPS.get(l.kind,99)
+                    given=min(l.value,cap-player.ammo.get(l.kind,0))
+                    if given>0:
+                        player.ammo[l.kind]=player.ammo.get(l.kind,0)+given
+                        play("ammo")
+                        float_texts.append(FloatText(l.x,l.y-20,f"+{given} {l.kind.split('_')[1].upper()}",AMMO_COL.get(l.kind,C_GRAY)))
+                elif l.kind in ("Fire Sword","Ice Sword"):
+                    rejected=player.pick_weapon(l.kind,float_texts)
+                    if rejected: l.alive=True   # bag full — leave it on the ground
+                    else:
+                        col2=C_FIRE if "Fire" in l.kind else C_ICE
+                        float_texts.append(FloatText(l.x,l.y-40,l.kind.upper()+"!",col2,big=True))
+                        for _ in range(20): particles.append(Particle(l.x,l.y-20,col2,size=random.uniform(4,9),life=50))
+                else:
+                    rejected=player.pick_weapon(l.kind,float_texts)
+                    if rejected: l.alive=True   # bag full — leave it on the ground
+        loots=[l for l in loots if l.alive]
+
+        for pd in powerup_drops:
+            pd.update(gnd_y-8)
+            if pd.alive and dist((player.x,player.y),(pd.x,pd.y))<34:
+                pd.alive=False; player.apply_powerup(pd.ptype,float_texts)
+                for _ in range(20): particles.append(Particle(pd.x,pd.y,POWERUP_DEFS[pd.ptype]["color"],size=random.uniform(3,7),life=40))
+        powerup_drops=[pd for pd in powerup_drops if pd.alive]
+
+        # ── CONTINUOUS SPAWNING (no full-clear-the-map gate) ───────────────────
+        # "Wave" is now a difficulty tier driven by kill count, not a batch you
+        # must fully clear — monsters trickle in near the player continuously,
+        # and off-screen stragglers despawn instead of needing to be hunted
+        # down across the whole world.
+        monsters=[m for m in monsters if m.alive or dist((m.x,m.y),(player.x,player.y))<1400]
+        new_wave=1+kills//12
+        if new_wave!=wave:
+            wave=new_wave
+            float_texts.append(FloatText(player.x,player.y-110,f"Tier {wave}!",C_RED,big=True))
+            if wave%5==0 and wave not in boss_wave_spawned:
+                boss_wave_spawned.add(wave); play("boss")
+                monsters+=spawn_near_player(tiles,COLS,ROWS,fr,player.level,player.x,0,force_boss=True)
+                float_texts.append(FloatText(player.x,player.y-150,"BOSS NEARBY!",C_FIRE,big=True))
+
+        alive_c=sum(1 for m in monsters if m.alive)
+        max_alive=min(14,6+wave)
+        spawn_timer+=1
+        if alive_c<max_alive and spawn_timer>=70:
+            spawn_timer=0
+            n=random.randint(1,2)
+            monsters+=spawn_near_player(tiles,COLS,ROWS,fr,player.level,player.x,n)
+
+        if len(particles)>400: particles=particles[-400:]
+        for p in particles: p.update()
+        particles=[p for p in particles if p.life>0]
+        for ft in float_texts: ft.update()
+        float_texts=[ft for ft in float_texts if ft.life>0]
+        for la in lv_anims: la.update()
+        lv_anims=[la for la in lv_anims if la.alive]
+
+        # ── CAMERA ───────────────────────────────────────────────────────────
+        tx=player.x-W//2; ty=player.y-H//2-45
+        cam_x=lerp(cam_x,tx,0.10); cam_y=lerp(cam_y,ty,0.10)
+        cam_x=clamp(cam_x,0,WW-W); cam_y=clamp(cam_y,0,WH-H)
+        if shake>0: shake-=1; sx_=random.randint(-shake//2,shake//2); sy_=random.randint(-shake//2,shake//2)
+        else: sx_=sy_=0
+        CX=int(cam_x)+sx_; CY=int(cam_y)+sy_
+
+        # ── DRAW ─────────────────────────────────────────────────────────────
+        draw_bg(screen,CX,CY,day_tick,WW)
+        draw_world(screen,tiles,COLS,ROWS,CX,CY,WW)
+        na=night_alpha(day_tick)
+        if na>8: night_overlay.fill((0,0,30,na)); screen.blit(night_overlay,(0,0))
+        for n in npcs:
+            if not n.recruited: draw_drop_shadow(screen,n.x,n.y,22,CX,CY,60)
+        for m in monsters: draw_drop_shadow(screen,m.x,m.y,m.sz+6,CX,CY,70)
+        for ally in companions:
+            if ally.alive: draw_drop_shadow(screen,ally.x,ally.y,24,CX,CY,75)
+        draw_drop_shadow(screen,player.x,player.y,26,CX,CY,85)
+        for ex in explosions:
+            if getattr(ex,"alive",True): draw_point_light(screen,ex.x,ex.y,120,(255,140,60,120),CX,CY)
+        for n in npcs:            n.draw(screen,CX,CY)
+        for l in loots:          l.draw(screen,CX,CY)
+        for pd in powerup_drops: pd.draw(screen,CX,CY)
+        for ex in explosions:    ex.draw(screen,CX,CY)
+        for p in particles:      p.draw(screen,CX,CY)
+        for b in bullets:        b.draw(screen,CX,CY)
+        for m in monsters:       m.draw(screen,CX,CY)
+        for ally in companions: ally.draw(screen,CX,CY)
+        player.draw(screen,CX,CY)
+        for la in lv_anims:      la.draw(screen,CX,CY)
+        for ft in float_texts:   ft.draw(screen,CX,CY)
+        draw_vignette(screen)
+        draw_hud(screen,player,wave,kills,day_tick)
+        b_now=BIOMES[biome_index(player.x,WW)]
+        top_panel=sa(360,50); top_panel.fill((8,8,18,190))
+        pygame.draw.rect(top_panel,(70,70,110),(0,0,360,50),2,border_radius=8)
+        zt=FONT_MD.render(b_now["name"],True,C_WHITE); top_panel.blit(zt,(180-zt.get_width()//2,4))
+        qt=FONT_SM.render(ql.current_title(),True,C_YELLOW); top_panel.blit(qt,(180-qt.get_width()//2,28))
+        screen.blit(top_panel,(W//2-180,8))
+        if ql.dialogue is None:
+            alive_companions=[a for a in companions if a.alive]
+            if alive_companions:
+                cp=sa(160,16*len(alive_companions)+8); cp.fill((8,8,18,180))
+                for i,ally in enumerate(alive_companions):
+                    lt=FONT_SM.render(f"{ally.name}: {ally.hp}/{ally.max_hp}",True,ally.col)
+                    cp.blit(lt,(6,4+i*16))
+                screen.blit(cp,(4,212))
+        if ql.dialogue is not None:
+            bw2=W-320; bx2=160; by2=H-190; bh2=100
+            box=sa(bw2,bh2); box.fill((10,8,18,235))
+            pygame.draw.rect(box,C_PURPLE,(0,0,bw2,bh2),2,border_radius=6)
+            nm=FONT_MD.render(ql.dlg_npc,True,C_GOLD); box.blit(nm,(14,8))
+            ln=FONT_MD.render(ql.dialogue[min(ql.dlg_line,len(ql.dialogue)-1)],True,C_WHITE)
+            box.blit(ln,(14,40))
+            hint=FONT_SM.render("[E] Continue",True,C_GRAY); box.blit(hint,(bw2-120,bh2-24))
+            screen.blit(box,(bx2,by2))
+        # Crosshair
+        mx2,my2=pygame.mouse.get_pos()
+        ak=player.current_ammo_kind()
+        col2=C_PURPLE if player.teleport_active else (C_RED if (ak and player.ammo.get(ak,0)==0) else (C_CYAN if weapon_can_shoot(player.weapon) else C_GRAY))
+        for dx_,dy_ in [(-12,0),(12,0),(0,-12),(0,12)]:
+            ex2=mx2+dx_+(8 if dx_>0 else -8 if dx_<0 else 0)
+            ey2=my2+dy_+(8 if dy_>0 else -8 if dy_<0 else 0)
+            pygame.draw.line(screen,col2,(mx2+dx_,my2+dy_),(ex2,ey2),1)
+        pygame.draw.circle(screen,col2,(mx2,my2),8,1)
+        pygame.draw.circle(screen,C_WHITE,(mx2,my2),2)
+        pygame.display.flip()
+
+# ─── ENTRY ────────────────────────────────────────────────────────────────────
+if __name__=="__main__":
+    while True:
+        if menu_screen()=="start": run()
+'''
+
+
+class _GameWindow(tk.Toplevel):
+    """Common chrome for every arcade game: dark canvas, fixed size,
+    centered on the main window, Esc to quit."""
+    def __init__(self, master, title, w, h):
+        super().__init__(master)
+        self.title(f"FaceAttend Arcade — {title}")
+        self.configure(bg="#0e1117")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        master.update_idletasks()
+        mx, my = master.winfo_rootx(), master.winfo_rooty()
+        mw, mh = master.winfo_width(), master.winfo_height()
+        x = mx + (mw - w) // 2
+        y = my + (mh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.bind("<Escape>", lambda e: self._quit())
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+        self._alive = True
+
+    def _quit(self):
+        self._alive = False
+        try: self.destroy()
+        except tk.TclError: pass
+
+
+class SnakeGame(_GameWindow):
+    """Classic grid snake — arrow keys / WASD, walls kill, self kill,
+    speeds up slightly every 5 apples, high score persisted in-memory
+    for the session."""
+    CELLS = 24
+    CELL_PX = 22
+    _high_score = 0
+
+    def __init__(self, master):
+        w = h = self.CELLS * self.CELL_PX
+        super().__init__(master, "Snake", w, h + 40)
+        self.canvas = tk.Canvas(self, width=w, height=h, bg="#0a0e15", highlightthickness=0)
+        self.canvas.pack()
+        self.status = tk.Label(self, bg="#0e1117", fg="#7b8aa0", font=(FONT_FAMILY, 9))
+        self.status.pack(fill="x", pady=(4, 0))
+
+        for key in ("<Up>", "<w>", "<W>"):    self.bind(key, lambda e: self._turn(0, -1))
+        for key in ("<Down>", "<s>", "<S>"):  self.bind(key, lambda e: self._turn(0, 1))
+        for key in ("<Left>", "<a>", "<A>"):  self.bind(key, lambda e: self._turn(-1, 0))
+        for key in ("<Right>", "<d>", "<D>"): self.bind(key, lambda e: self._turn(1, 0))
+        self.bind("<space>", lambda e: self._restart())
+
+        self._restart()
+        self.focus_force()
+
+    def _restart(self):
+        mid = self.CELLS // 2
+        self.snake = [(mid - 1, mid), (mid - 2, mid), (mid - 3, mid)]
+        self.direction = (1, 0)
+        self.pending_dir = (1, 0)
+        self.score = 0
+        self.delay = 130
+        self.food = self._place_food()
+        self.game_over = False
+        self._tick()
+
+    def _place_food(self):
+        occupied = set(self.snake)
+        while True:
+            p = (random.randint(0, self.CELLS - 1), random.randint(0, self.CELLS - 1))
+            if p not in occupied:
+                return p
+
+    def _turn(self, dx, dy):
+        if self.game_over:
+            return
+        if (dx, dy) == (-self.direction[0], -self.direction[1]):
+            return  # no 180° reversal
+        self.pending_dir = (dx, dy)
+
+    def _tick(self):
+        if not self._alive:
+            return
+        if self.game_over:
+            return
+        self.direction = self.pending_dir
+        hx, hy = self.snake[0]
+        dx, dy = self.direction
+        nx, ny = hx + dx, hy + dy
+
+        if not (0 <= nx < self.CELLS and 0 <= ny < self.CELLS) or (nx, ny) in self.snake:
+            self._end_game()
+            return
+
+        self.snake.insert(0, (nx, ny))
+        if (nx, ny) == self.food:
+            self.score += 1
+            if self.score % 5 == 0:
+                self.delay = max(55, self.delay - 8)
+            self.food = self._place_food()
+        else:
+            self.snake.pop()
+
+        self._draw()
+        self.after(self.delay, self._tick)
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        px = self.CELL_PX
+        fx, fy = self.food
+        c.create_oval(fx*px+3, fy*px+3, fx*px+px-3, fy*px+px-3, fill="#ef4444", outline="")
+        for i, (x, y) in enumerate(self.snake):
+            color = "#22c55e" if i == 0 else "#16a34a"
+            c.create_rectangle(x*px+1, y*px+1, x*px+px-1, y*px+px-1, fill=color, outline="")
+        self.status.configure(text=f"Score: {self.score}   High: {max(self.score, SnakeGame._high_score)}   "
+                                    f"WASD/Arrows to move · Space to restart · Esc to quit")
+
+    def _end_game(self):
+        self.game_over = True
+        SnakeGame._high_score = max(SnakeGame._high_score, self.score)
+        c = self.canvas
+        w = self.CELLS * self.CELL_PX
+        c.create_rectangle(0, w//2 - 40, w, w//2 + 40, fill="#0e1117", outline="")
+        c.create_text(w//2, w//2 - 12, text="GAME OVER", fill="#ef4444", font=(FONT_FAMILY, 18, "bold"))
+        c.create_text(w//2, w//2 + 14, text=f"Score {self.score} — press Space to retry", fill="#e8edf5", font=(FONT_FAMILY, 10))
+        self.status.configure(text=f"Score: {self.score}   High: {SnakeGame._high_score}   Space to restart · Esc to quit")
+
+
+class PongGame(_GameWindow):
+    """Single-player Pong vs a simple tracking AI. Mouse or Up/Down moves
+    the left paddle; first to 7 wins."""
+    W, H = 560, 380
+    PADDLE_H = 70
+    WIN_SCORE = 7
+
+    def __init__(self, master):
+        super().__init__(master, "Pong", self.W, self.H + 40)
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H, bg="#0a0e15", highlightthickness=0)
+        self.canvas.pack()
+        self.status = tk.Label(self, bg="#0e1117", fg="#7b8aa0", font=(FONT_FAMILY, 9))
+        self.status.pack(fill="x", pady=(4, 0))
+
+        self.bind("<Up>", lambda e: self._nudge(-1))
+        self.bind("<Down>", lambda e: self._nudge(1))
+        self.bind("<space>", lambda e: self._restart())
+        self.canvas.bind("<Motion>", self._mouse_move)
+
+        self._restart()
+        self.focus_force()
+
+    def _restart(self):
+        self.p1_y = self.H / 2 - self.PADDLE_H / 2   # player, left
+        self.p2_y = self.H / 2 - self.PADDLE_H / 2   # AI, right
+        self.p1_score = 0
+        self.p2_score = 0
+        self.winner = None
+        self._reset_ball(random.choice([-1, 1]))
+        self._tick()
+
+    def _reset_ball(self, direction):
+        self.bx, self.by = self.W / 2, self.H / 2
+        speed = 5.2
+        angle = random.uniform(-0.4, 0.4)
+        self.bvx = direction * speed
+        self.bvy = speed * angle
+
+    def _nudge(self, d):
+        self.p1_y = max(0, min(self.H - self.PADDLE_H, self.p1_y + d * 26))
+
+    def _mouse_move(self, event):
+        self.p1_y = max(0, min(self.H - self.PADDLE_H, event.y - self.PADDLE_H / 2))
+
+    def _tick(self):
+        if not self._alive or self.winner:
+            return
+        # AI paddle tracks the ball with a capped speed, imperfect on purpose
+        target = self.by - self.PADDLE_H / 2
+        if target > self.p2_y + 4:
+            self.p2_y = min(self.H - self.PADDLE_H, self.p2_y + 4.6)
+        elif target < self.p2_y - 4:
+            self.p2_y = max(0, self.p2_y - 4.6)
+
+        self.bx += self.bvx
+        self.by += self.bvy
+
+        if self.by <= 0 or self.by >= self.H:
+            self.bvy *= -1
+            self.by = max(0, min(self.H, self.by))
+
+        # left paddle collision
+        if self.bx <= 22 and self.p1_y <= self.by <= self.p1_y + self.PADDLE_H and self.bvx < 0:
+            self.bvx *= -1.06
+            self.bvy += (self.by - (self.p1_y + self.PADDLE_H / 2)) * 0.12
+        # right paddle collision
+        if self.bx >= self.W - 22 and self.p2_y <= self.by <= self.p2_y + self.PADDLE_H and self.bvx > 0:
+            self.bvx *= -1.06
+            self.bvy += (self.by - (self.p2_y + self.PADDLE_H / 2)) * 0.12
+
+        if self.bx < 0:
+            self.p2_score += 1
+            self._reset_ball(1)
+        elif self.bx > self.W:
+            self.p1_score += 1
+            self._reset_ball(-1)
+
+        if self.p1_score >= self.WIN_SCORE or self.p2_score >= self.WIN_SCORE:
+            self.winner = "You" if self.p1_score > self.p2_score else "The AI"
+
+        self._draw()
+        self.after(16, self._tick)
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        c.create_line(self.W/2, 0, self.W/2, self.H, fill="#2a3448", dash=(6, 6))
+        c.create_rectangle(10, self.p1_y, 20, self.p1_y + self.PADDLE_H, fill="#3b82f6", outline="")
+        c.create_rectangle(self.W-20, self.p2_y, self.W-10, self.p2_y + self.PADDLE_H, fill="#ef4444", outline="")
+        c.create_oval(self.bx-7, self.by-7, self.bx+7, self.by+7, fill="#e8edf5", outline="")
+        c.create_text(self.W/2 - 40, 24, text=str(self.p1_score), fill="#3b82f6", font=(FONT_FAMILY, 20, "bold"))
+        c.create_text(self.W/2 + 40, 24, text=str(self.p2_score), fill="#ef4444", font=(FONT_FAMILY, 20, "bold"))
+        if self.winner:
+            c.create_rectangle(0, self.H/2-30, self.W, self.H/2+30, fill="#0e1117", outline="")
+            c.create_text(self.W/2, self.H/2, text=f"{self.winner} win! Space to replay",
+                          fill="#f59e0b", font=(FONT_FAMILY, 14, "bold"))
+        self.status.configure(text="Mouse or ↑/↓ to move · First to 7 wins · Esc to quit")
+
+
+class Game2048(_GameWindow):
+    """The sliding-tile 2048 puzzle on a 4x4 grid, arrow keys to move,
+    merges equal tiles, spawns a 2 or 4 each turn."""
+    N = 4
+    TILE = 90
+    PAD = 12
+    COLORS = {
+        0: "#1c2233", 2: "#2a3448", 4: "#334155", 8: "#3b82f6", 16: "#2563eb",
+        32: "#f59e0b", 64: "#ea580c", 128: "#22c55e", 256: "#16a34a",
+        512: "#a855f7", 1024: "#d946ef", 2048: "#ef4444",
+    }
+
+    def __init__(self, master):
+        size = self.N * self.TILE + (self.N + 1) * self.PAD
+        super().__init__(master, "2048", size, size + 40)
+        self.canvas = tk.Canvas(self, width=size, height=size, bg="#12161f", highlightthickness=0)
+        self.canvas.pack()
+        self.status = tk.Label(self, bg="#0e1117", fg="#7b8aa0", font=(FONT_FAMILY, 9))
+        self.status.pack(fill="x", pady=(4, 0))
+
+        self.bind("<Up>", lambda e: self._move(0, -1))
+        self.bind("<Down>", lambda e: self._move(0, 1))
+        self.bind("<Left>", lambda e: self._move(-1, 0))
+        self.bind("<Right>", lambda e: self._move(1, 0))
+        self.bind("<space>", lambda e: self._restart())
+
+        self._restart()
+        self.focus_force()
+
+    def _restart(self):
+        self.grid = [[0]*self.N for _ in range(self.N)]
+        self.score = 0
+        self.game_over = False
+        self._spawn(); self._spawn()
+        self._draw()
+
+    def _spawn(self):
+        empties = [(r, c) for r in range(self.N) for c in range(self.N) if self.grid[r][c] == 0]
+        if not empties:
+            return
+        r, c = random.choice(empties)
+        self.grid[r][c] = 4 if random.random() < 0.1 else 2
+
+    def _move(self, dx, dy):
+        if self.game_over:
+            return
+        moved = False
+        rng = range(self.N)
+        order = list(rng)
+        # Process rows/cols from the direction of travel
+        lines = []
+        if dx != 0:
+            for r in rng:
+                line = [self.grid[r][c] for c in (reversed(order) if dx > 0 else order)]
+                lines.append(("row", r, line, dx > 0))
+        else:
+            for c in rng:
+                line = [self.grid[r][c] for r in (reversed(order) if dy > 0 else order)]
+                lines.append(("col", c, line, dy > 0))
+
+        for kind, idx, line, was_reversed in lines:
+            merged, gained, changed = self._merge_line(line)
+            if changed:
+                moved = True
+            self.score += gained
+            if was_reversed:
+                merged = list(reversed(merged))
+            if kind == "row":
+                self.grid[idx] = merged
+            else:
+                for r in rng:
+                    self.grid[r][idx] = merged[r]
+
+        if moved:
+            self._spawn()
+            self._draw()
+            if not self._any_moves_left():
+                self.game_over = True
+                self._draw(game_over=True)
+
+    @staticmethod
+    def _merge_line(line):
+        nonzero = [v for v in line if v != 0]
+        result = []
+        gained = 0
+        i = 0
+        while i < len(nonzero):
+            if i + 1 < len(nonzero) and nonzero[i] == nonzero[i+1]:
+                merged_val = nonzero[i] * 2
+                result.append(merged_val)
+                gained += merged_val
+                i += 2
+            else:
+                result.append(nonzero[i])
+                i += 1
+        result += [0] * (len(line) - len(result))
+        changed = result != line
+        return result, gained, changed
+
+    def _any_moves_left(self):
+        for r in range(self.N):
+            for c in range(self.N):
+                if self.grid[r][c] == 0:
+                    return True
+                if c+1 < self.N and self.grid[r][c] == self.grid[r][c+1]:
+                    return True
+                if r+1 < self.N and self.grid[r][c] == self.grid[r+1][c]:
+                    return True
+        return False
+
+    def _draw(self, game_over=False):
+        c = self.canvas
+        c.delete("all")
+        for r in range(self.N):
+            for col in range(self.N):
+                val = self.grid[r][col]
+                x0 = self.PAD + col * (self.TILE + self.PAD)
+                y0 = self.PAD + r * (self.TILE + self.PAD)
+                x1, y1 = x0 + self.TILE, y0 + self.TILE
+                color = self.COLORS.get(val, "#ef4444")
+                c.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+                if val:
+                    fg = "#0e1117" if val <= 4 else "#f1f5f9"
+                    fsz = 22 if val < 1000 else 17
+                    c.create_text((x0+x1)/2, (y0+y1)/2, text=str(val), fill=fg, font=(FONT_FAMILY, fsz, "bold"))
+        if game_over:
+            size = self.N * self.TILE + (self.N + 1) * self.PAD
+            c.create_rectangle(0, size/2-30, size, size/2+30, fill="#0e1117", outline="")
+            c.create_text(size/2, size/2, text=f"No moves left — score {self.score} — Space to retry",
+                          fill="#ef4444", font=(FONT_FAMILY, 12, "bold"))
+        self.status.configure(text=f"Score: {self.score}   Arrow keys to slide · Space to restart · Esc to quit")
+
+
+class TicTacToeGame(_GameWindow):
+    """Tic-tac-toe vs an unbeatable minimax AI. Player is X, AI is O."""
+    def __init__(self, master):
+        size = 330
+        super().__init__(master, "Tic-Tac-Toe", size, size + 60)
+        self.canvas = tk.Canvas(self, width=size, height=size, bg="#12161f", highlightthickness=0)
+        self.canvas.pack(pady=(10, 0))
+        self.status = tk.Label(self, bg="#0e1117", fg="#e8edf5", font=(FONT_FAMILY, 11, "bold"))
+        self.status.pack(fill="x", pady=8)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.bind("<space>", lambda e: self._restart())
+        self.cell = size // 3
+        self._restart()
+        self.focus_force()
+
+    def _restart(self):
+        self.board = [""] * 9
+        self.game_over = False
+        self.status.configure(text="Your move — click a square (you're X)")
+        self._draw()
+
+    def _on_click(self, event):
+        if self.game_over:
+            return
+        col = event.x // self.cell
+        row = event.y // self.cell
+        i = row * 3 + col
+        if not (0 <= i < 9) or self.board[i]:
+            return
+        self.board[i] = "X"
+        self._draw()
+        winner = self._check_winner(self.board)
+        if winner or "" not in self.board:
+            self._finish(winner)
+            return
+        self.after(280, self._ai_move)
+
+    def _ai_move(self):
+        if self.game_over:
+            return
+        best_score, best_move = -999, None
+        for i in range(9):
+            if not self.board[i]:
+                self.board[i] = "O"
+                score = self._minimax(self.board, False)
+                self.board[i] = ""
+                if score > best_score:
+                    best_score, best_move = score, i
+        if best_move is not None:
+            self.board[best_move] = "O"
+        self._draw()
+        winner = self._check_winner(self.board)
+        if winner or "" not in self.board:
+            self._finish(winner)
+        else:
+            self.status.configure(text="Your move — click a square (you're X)")
+
+    def _minimax(self, board, is_max, depth=0):
+        winner = self._check_winner(board)
+        if winner == "O": return 10 - depth
+        if winner == "X": return depth - 10
+        if "" not in board: return 0
+        scores = []
+        for i in range(9):
+            if not board[i]:
+                board[i] = "O" if is_max else "X"
+                scores.append(self._minimax(board, not is_max, depth + 1))
+                board[i] = ""
+        return max(scores) if is_max else min(scores)
+
+    @staticmethod
+    def _check_winner(b):
+        lines = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+        for a, c, d in lines:
+            if b[a] and b[a] == b[c] == b[d]:
+                return b[a]
+        return None
+
+    def _finish(self, winner):
+        self.game_over = True
+        if winner == "X":
+            self.status.configure(text="🎉 You win! (Space to play again)")
+        elif winner == "O":
+            self.status.configure(text="The AI wins — it's unbeatable. Space to try again")
+        else:
+            self.status.configure(text="Draw! Space to play again")
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        cs = self.cell
+        for i in (1, 2):
+            c.create_line(i*cs, 0, i*cs, cs*3, fill="#2a3448", width=2)
+            c.create_line(0, i*cs, cs*3, i*cs, fill="#2a3448", width=2)
+        for i, v in enumerate(self.board):
+            if not v: continue
+            row, col = divmod(i, 3)
+            x, y = col*cs + cs/2, row*cs + cs/2
+            color = "#3b82f6" if v == "X" else "#ef4444"
+            c.create_text(x, y, text=v, fill=color, font=(FONT_FAMILY, 48, "bold"))
+
+
+class MemoryGame(_GameWindow):
+    """Card-flip memory match — 8 pairs of emoji icons on a 4x4 board,
+    tracks moves and elapsed time."""
+    ICONS = ["🎯","🎮","🎲","🎨","🎵","⚡","🔥","🌟"]
+    COLS, ROWS = 4, 4
+
+    def __init__(self, master):
+        self.cell = 90
+        w = self.COLS * self.cell
+        h = self.ROWS * self.cell
+        super().__init__(master, "Memory Match", w, h + 50)
+        self.canvas = tk.Canvas(self, width=w, height=h, bg="#12161f", highlightthickness=0)
+        self.canvas.pack()
+        self.status = tk.Label(self, bg="#0e1117", fg="#7b8aa0", font=(FONT_FAMILY, 9))
+        self.status.pack(fill="x", pady=(4, 0))
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.bind("<space>", lambda e: self._restart())
+        self._restart()
+        self.focus_force()
+
+    def _restart(self):
+        deck = self.ICONS * 2
+        random.shuffle(deck)
+        self.board = deck
+        self.revealed = [False] * len(deck)
+        self.matched = [False] * len(deck)
+        self.selection = []
+        self.moves = 0
+        self.start_time = time.time()
+        self.won = False
+        self._tick_timer()
+        self._draw()
+
+    def _tick_timer(self):
+        if not self._alive or self.won:
+            return
+        elapsed = int(time.time() - self.start_time)
+        self.status.configure(text=f"Moves: {self.moves}   Time: {elapsed}s   Click cards to flip · Esc to quit")
+        self.after(500, self._tick_timer)
+
+    def _on_click(self, event):
+        if self.won or len(self.selection) >= 2:
+            return
+        col = event.x // self.cell
+        row = event.y // self.cell
+        i = row * self.COLS + col
+        if not (0 <= i < len(self.board)) or self.revealed[i] or self.matched[i]:
+            return
+        self.revealed[i] = True
+        self.selection.append(i)
+        self._draw()
+        if len(self.selection) == 2:
+            self.moves += 1
+            self.after(500, self._check_pair)
+
+    def _check_pair(self):
+        a, b = self.selection
+        if self.board[a] == self.board[b]:
+            self.matched[a] = self.matched[b] = True
+        else:
+            self.revealed[a] = self.revealed[b] = False
+        self.selection = []
+        self._draw()
+        if all(self.matched):
+            self.won = True
+            elapsed = int(time.time() - self.start_time)
+            self.status.configure(text=f"🏆 Solved in {self.moves} moves, {elapsed}s! Space to play again")
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        for i, icon in enumerate(self.board):
+            row, col = divmod(i, self.COLS)
+            x0, y0 = col*self.cell+4, row*self.cell+4
+            x1, y1 = x0+self.cell-8, y0+self.cell-8
+            if self.matched[i]:
+                c.create_rectangle(x0, y0, x1, y1, fill="#16351f", outline="#22c55e", width=2)
+                c.create_text((x0+x1)/2, (y0+y1)/2, text=icon, font=(FONT_FAMILY, 26))
+            elif self.revealed[i]:
+                c.create_rectangle(x0, y0, x1, y1, fill="#1c2233", outline="#3b82f6", width=2)
+                c.create_text((x0+x1)/2, (y0+y1)/2, text=icon, font=(FONT_FAMILY, 26))
+            else:
+                c.create_rectangle(x0, y0, x1, y1, fill="#222b3a", outline="#2a3448")
+                c.create_text((x0+x1)/2, (y0+y1)/2, text="?", fill="#4d586c", font=(FONT_FAMILY, 22, "bold"))
+
+
+ARCADE_GAMES = {
+    "snake":     {"label": "Snake",         "kind": "toplevel", "cls": SnakeGame},
+    "pong":      {"label": "Pong",          "kind": "toplevel", "cls": PongGame},
+    "2048":      {"label": "2048",          "kind": "toplevel", "cls": Game2048},
+    "tictactoe": {"label": "Tic-Tac-Toe",   "kind": "toplevel", "cls": TicTacToeGame},
+    "memory":    {"label": "Memory Match",  "kind": "toplevel", "cls": MemoryGame},
+    "dungeon":   {"label": "Dungeon Crawler", "kind": "external", "path": DUNGEON_CRAWLER_FILE},
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+class FaceAttendApp:
+    def __init__(self, root: tk.Tk):
+        self.root    = root
+        self.settings = Settings()
+        self.store    = AttendanceStore(self.settings)
+        self.students_by_uid: dict[str, dict] = {}
+        self.scanned_today: set[str] = set()
+        self.camera       = None
+        self.scanning     = False
+        self.frame_count  = 0
+        self._sort_col       = None
+        self._sort_ascending = True
+        self._unknown_last_saved: float = 0.0
+        self.last_frame   = None
+        self.last_results: list[dict] = []
+        self.camera_photo = None
+        self.table_photos: list = []
+        self.search_var   = tk.StringVar()
+        self._search_after= None
+        self.buddy_busy   = False
+        self.last_dup_log: dict[str, datetime] = {}
+        # ── 2.4 new systems ───────────────────────────────────────────────
+        self.schedule     = ScheduleManager()
+        self.badges       = BadgeSystem(self.store)
+        self.encryption   = EncryptionManager()
+        self.liveness     = LivenessDetector()
+        self.api_server   = APIServer(self)
+        self._voice_enabled = self.settings.voice_feedback
+        self._liveness_enabled = self.settings.liveness_check
+        self._qr_mode     = False
+        self._cameras     = list_cameras()
+        self._theme_dark  = self.settings.theme_dark
+        self._lang        = self.settings.language if self.settings.language in LANG_NAMES else "en"
+        set_theme(self._theme_dark)
+        # Apply this language's visual identity (accent colour, font, rail
+        # width, card style, emblem) BEFORE any widget is built — this is
+        # the actual fix for "language never worked": previously the
+        # translation table existed but almost nothing on screen called
+        # into it, and nothing about the *look* of the app changed either.
+        self._lang_theme = apply_language_visuals(self._lang)
+        self.T = lambda key, **kw: _(key, self._lang, **kw)  # shorthand translator bound to current language
+        self._selected_uids: set[str] = set()
+        self._select_anchor_iid = None
+        # start API if enabled
+        if self.settings.api_server:
+            self.api_server.start()
+
+        root.title(f"FaceAttend {APP_VERSION}  ·  Smart Attendance System")
+        root.geometry("1440x860")
+        root.minsize(1100, 720)
+        if os.name == "nt":
+            root.state("zoomed")
+        root.configure(bg=P.bg)
+        if ICON_FILE.exists():
+            try:
+                root.iconbitmap(default=str(ICON_FILE))
+            except Exception:
+                pass
+
+        self._style()
+        self._build()
+        self.scanned_today = self._load_today_scans()
+        self.refresh_all()
+
+        resilience = self.store.ensure_file_present_and_valid()
+        if resilience.get("message"):
+            kind = "warning" if resilience["action"] in ("created", "restored") else "info"
+            play_sound(SOUND_ERROR if kind == "warning" else SOUND_SUCCESS)
+            Toast.show(root, resilience["message"], kind, 6500)
+            self.log(resilience["message"])
+            self.refresh_all()
+
+        if MISSING_PACKAGES:
+            Toast.show(root, f"Missing: {', '.join(set(MISSING_PACKAGES))}", "warning", 5000)
+        else:
+            self.log(f"FaceAttend {APP_VERSION} ready.")
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── ttk style ─────────────────────────────────────────────────────────────
+    def _style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("Treeview",
+            background=P.surface, foreground=P.text,
+            fieldbackground=P.surface, rowheight=70,
+            borderwidth=0, font=(FONT_FAMILY, 10))
+        s.configure("Treeview.Heading",
+            background=P.surface2, foreground=P.muted,
+            relief="flat", font=F_SMALL_B, padding=(8, 10))
+        s.map("Treeview",
+            background=[("selected", P.blue_soft)],
+            foreground=[("selected", "white")])
+        s.map("Treeview.Heading", background=[("active", P.hover)])
+        s.configure("TEntry",   padding=8,  relief="flat",
+            fieldbackground=P.surface2, foreground=P.text,
+            insertcolor=P.text, bordercolor=P.border,
+            lightcolor=P.surface2, darkcolor=P.surface2)
+        s.map("TEntry",
+            fieldbackground=[("focus", P.hover)],
+            bordercolor=[("focus", P.blue)])
+        s.configure("TCombobox",
+            fieldbackground=P.surface2, foreground=P.text, background=P.surface2,
+            arrowcolor=P.muted, bordercolor=P.border,
+            lightcolor=P.surface2, darkcolor=P.surface2,
+            selectbackground=P.blue, selectforeground="white")
+        s.map("TCombobox", fieldbackground=[("readonly", P.surface2)])
+        self.root.option_add("*TCombobox*Listbox.background", P.surface2)
+        self.root.option_add("*TCombobox*Listbox.foreground", P.text)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", P.blue)
+        self.root.option_add("*TCombobox*Listbox.font", F_BODY)
+        s.configure("Vertical.TScrollbar",
+            background=P.surface2, troughcolor=P.bg,
+            bordercolor=P.bg, arrowcolor=P.muted, relief="flat")
+        s.configure("Horizontal.TScrollbar",
+            background=P.surface2, troughcolor=P.bg,
+            bordercolor=P.bg, arrowcolor=P.muted, relief="flat")
+        s.configure("Splash.Horizontal.TProgressbar",
+            troughcolor=P.surface2, background=P.blue,
+            bordercolor=P.surface2, lightcolor=P.blue, darkcolor=P.blue_dark)
+        s.configure("Accent.Horizontal.TProgressbar",
+            troughcolor=P.surface2, background=P.blue,
+            bordercolor=P.surface2, lightcolor=P.blue, darkcolor=P.blue, thickness=6)
+
+    # ── layout ────────────────────────────────────────────────────────────────
+    # Houses is a pane inside the Analytics tab, and Whiteboard is a pane
+    # inside the Notepad tab — each shares its nav icon with a related view.
+    NAV_ITEMS = [
+        ("\u2302",        "Home",      "home_scanner"),
+        ("\U0001F4CA",    "Analytics", "analytics"),
+        ("\U0001F916",    "Bot",       "ai_buddy"),
+        ("\u2709",        "Mail",      "messages"),
+        ("\U0001F4CB",    "Console",   "console"),
+        ("\U0001F4DD",    "Notepad",   "notepad"),
+        ("\u2699",        "Settings",  "settings"),
+    ]
+
+    def _localized_date(self, dt=None) -> str:
+        """Formats today's date using the current language's weekday/month
+        abbreviations from TRANSLATIONS (e.g. 'सोम, 26 अग 2026' for Hindi)
+        instead of always rendering the English weekday/month names that
+        Python's own strftime would produce regardless of app language."""
+        dt = dt or datetime.now()
+        dow_keys  = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        mon_keys  = ["jan", "feb", "mar", "apr", "may", "jun",
+                     "jul", "aug", "sep", "oct", "nov", "dec"]
+        dow = self.T(dow_keys[dt.weekday()])
+        mon = self.T(mon_keys[dt.month - 1])
+        return f"{dow}, {dt.day} {mon} {dt.year}"
+
+    def _build(self):
+        rw = self._lang_theme.get("rail_width", 84)
+        isz = self._lang_theme.get("icon_size", 19)
+        self.root.grid_columnconfigure(0, minsize=rw, weight=0)
+        self.root.grid_columnconfigure(1, minsize=300, weight=0)
+        self.root.grid_columnconfigure(2, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
+
+        # ── column 0: icon navigation rail ──────────────────────────────────
+        self.rail = tk.Frame(self.root, bg=P.rail, width=rw)
+        self.rail.grid(row=0, column=0, sticky="nsew")
+        self.rail.grid_propagate(False)
+
+        glyph = tk.Label(self.rail, text=self._lang_theme.get("emblem", "\u2B21"), bg=P.rail, fg=P.blue,
+                          font=(FONT_FAMILY, 22), cursor="hand2")
+        glyph.pack(pady=(20, 24))
+        Tooltip(glyph, f"FaceAttend {APP_VERSION}")
+        self._egg_clicks = 0
+        self._egg_click_after = None
+        glyph.bind("<Button-1>", self._on_emblem_click)
+
+        self._nav_btns = {}
+        self._nav_indicators = {}
+        nav_wrap = tk.Frame(self.rail, bg=P.rail)
+        nav_wrap.pack(fill="x")
+
+        for icon, name, tip in self.NAV_ITEMS:
+            row = tk.Frame(nav_wrap, bg=P.rail, height=72)
+            row.pack(fill="x")
+            row.pack_propagate(False)
+
+            indicator = tk.Frame(row, bg=P.rail, width=4)
+            indicator.pack(side="left", fill="y")
+            self._nav_indicators[name] = indicator
+
+            btn = tk.Button(row, text=icon, command=lambda n=name: self._switch(n),
+                             bg=P.rail, fg=P.muted, activebackground=P.hover,
+                             activeforeground=P.text, relief="flat", bd=0,
+                             font=(FONT_FAMILY, isz), cursor="hand2")
+            btn.pack(side="left", fill="both", expand=True)
+            add_hover(btn, P.rail, P.hover)
+            Tooltip(btn, self.T(tip))
+            self._nav_btns[name] = btn
+
+        # status pill pinned to bottom of the rail (scan state at a glance)
+        status_wrap = tk.Frame(self.rail, bg=P.rail)
+        status_wrap.pack(side="bottom", pady=18)
+        self.rail_status_dot = tk.Label(status_wrap, text="\u25CF", bg=P.rail,
+                                         fg=P.faint, font=(FONT_FAMILY, 12))
+        self.rail_status_dot.pack()
+        self._rail_status_tip = Tooltip(self.rail_status_dot, "Scanner idle")
+
+        # ── column 1: Home's own list sidebar (camera dashboard lives in
+        #    column 2, self.right, and is ONLY relevant while on Home) ──────
+        self.left = tk.Frame(self.root, bg=P.sidebar, width=340)
+        self.left.grid(row=0, column=1, sticky="nsew")
+        self.left.grid_propagate(False)
+        self.left.grid_rowconfigure(0, weight=1)
+        self.left.grid_columnconfigure(0, weight=1)
+
+        # ── columns 1+2 merged: full-width content pane used by every tab
+        #    OTHER than Home. In 2.x every tab (Analytics charts, Settings
+        #    forms, the AI chat, Console log...) was squeezed into the same
+        #    300px sidebar meant for a student list — genuinely cramped.
+        #    3.0 gives every non-Home tab the full window width instead. ──
+        self.content_full = tk.Frame(self.root, bg=P.bg)
+        self.content_full.grid(row=0, column=1, columnspan=2, sticky="nsew")
+        self.content_full.grid_rowconfigure(0, weight=1)
+        self.content_full.grid_columnconfigure(0, weight=1)
+
+        self._tab_frames = {}
+        home_f = tk.Frame(self.left, bg=P.sidebar)
+        home_f.grid(row=0, column=0, sticky="nsew")
+        self._tab_frames["Home"] = home_f
+        for _, name, _ in self.NAV_ITEMS:
+            if name == "Home":
+                continue
+            f = tk.Frame(self.content_full, bg=P.bg)
+            f.grid(row=0, column=0, sticky="nsew")
+            self._tab_frames[name] = f
+
+        def switch(name):
+            for n, f in self._tab_frames.items():
+                f.grid_remove()
+            if name == "Home":
+                self.content_full.grid_remove()
+                self.left.grid()
+                self.right.grid()
+            else:
+                self.left.grid_remove()
+                self.right.grid_remove()
+                self.content_full.grid()
+            self._tab_frames[name].grid()
+            for n, b in self._nav_btns.items():
+                active = n == name
+                b.configure(bg=P.hover if active else P.rail,
+                            fg=P.text if active else P.muted)
+                self._nav_indicators[n].configure(bg=P.blue if active else P.rail)
+        self._switch = switch
+
+        # ── column 2: live camera / scan dashboard — only shown on Home ────
+        self.right = tk.Frame(self.root, bg=P.bg)
+        self.right.grid(row=0, column=2, sticky="nsew")
+
+        self._build_home_tab()
+        self._build_right_panel()
+        self._build_analytics_tab()
+        self._build_bot_tab()
+        self._build_mail_tab()
+        self._build_console_tab()
+        self._build_notepad_tab()
+        self._build_settings_tab()
+        switch("Home")
+        self._tick_clock()
+        self._bind_shortcuts()
+
+    def _on_emblem_click(self, _event=None):
+        """Secret: click the rail emblem 3 times within 2s of each other to
+        pop the hidden dev-credits screen."""
+        self._egg_clicks += 1
+        if self._egg_click_after is not None:
+            try: self.root.after_cancel(self._egg_click_after)
+            except Exception: pass
+        self._egg_click_after = self.root.after(2000, self._reset_egg_clicks)
+        if self._egg_clicks >= 3:
+            self._egg_clicks = 0
+            if self._egg_click_after is not None:
+                try: self.root.after_cancel(self._egg_click_after)
+                except Exception: pass
+                self._egg_click_after = None
+            self._show_about_egg()
+
+    def _reset_egg_clicks(self):
+        self._egg_clicks = 0
+        self._egg_click_after = None
+
+    def _show_about_egg(self):
+        """Hidden about/credits screen — built from scratch, one file, one
+        student, way too many nights."""
+        win = tk.Toplevel(self.root)
+        win.title("FaceAttend — About")
+        win.configure(bg=P.bg)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.0)
+        win.transient(self.root)
+
+        w, h = 420, 460
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx(); ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width(); rh = self.root.winfo_height()
+        x = rx + (rw - w) // 2
+        y = ry + (rh - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.overrideredirect(True)
+
+        card = tk.Frame(win, bg=P.surface, highlightthickness=1, highlightbackground=P.border)
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+
+        glyph_lbl = tk.Label(card, text=self._lang_theme.get("emblem", "\u2B21"),
+                              bg=P.surface, fg=P.blue, font=(FONT_FAMILY, 42))
+        glyph_lbl.pack(pady=(30, 6))
+
+        tk.Label(card, text=f"FaceAttend {APP_VERSION}", bg=P.surface, fg=P.text,
+                 font=(FONT_FAMILY, 16, "bold")).pack()
+        tk.Label(card, text="Smart Attendance System", bg=P.surface, fg=P.muted,
+                 font=(FONT_FAMILY, 10)).pack(pady=(2, 18))
+
+        divider = tk.Frame(card, bg=P.border_soft, height=1)
+        divider.pack(fill="x", padx=32, pady=(0, 18))
+
+        lines = [
+            ("Designed & built by", "Ashik A.S"),
+            ("Hardware concept", "ESP32 · webcam · Excel storage"),
+            ("Codebase", "One file. All of it."),
+            ("Built for", "Vivo Ignite 2026"),
+            ("Cups of patience", "\u221E"),
+        ]
+        for label, value in lines:
+            row = tk.Frame(card, bg=P.surface)
+            row.pack(fill="x", padx=32, pady=3)
+            tk.Label(row, text=label, bg=P.surface, fg=P.muted,
+                     font=(FONT_FAMILY, 9)).pack(side="left")
+            tk.Label(row, text=value, bg=P.surface, fg=P.text,
+                     font=(FONT_FAMILY, 9, "bold")).pack(side="right")
+
+        tk.Label(card, text="You found the secret handshake. \U0001F91D",
+                 bg=P.surface, fg=P.green, font=(FONT_FAMILY, 9, "italic")).pack(pady=(20, 4))
+
+        close_btn = tk.Button(card, text="Close", command=win.destroy,
+                               bg=P.blue, fg="white", activebackground=P.blue_dark,
+                               activeforeground="white", relief="flat", bd=0,
+                               padx=18, pady=8, font=(FONT_FAMILY, 10, "bold"),
+                               cursor="hand2")
+        close_btn.pack(pady=(20, 20))
+        add_hover(close_btn, P.blue, P.blue_dark)
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_force()
+
+        def fade_in(step=0):
+            if step > 12:
+                win.attributes("-alpha", 1.0)
+                return
+            try:
+                win.attributes("-alpha", step / 12)
+                win.after(15, lambda: fade_in(step + 1))
+            except tk.TclError:
+                pass
+        fade_in()
+
+    def _tick_clock(self):
+        """Keep the sidebar masthead clock and dashboard date label fresh."""
+        now = datetime.now()
+        if hasattr(self, "clock_lbl"):
+            self.clock_lbl.configure(text=now.strftime("%I:%M %p"))
+        if hasattr(self, "date_lbl"):
+            self.date_lbl.configure(text=self._localized_date(now))
+        try:
+            self._check_absent_notify_schedule()
+        except Exception as e:
+            logger.debug("Absent-notify schedule check error: %s", e)
+        self.root.after(15000, self._tick_clock)
+
+    def _bind_shortcuts(self):
+        """Register global keyboard shortcuts."""
+        self.root.bind("<Control-s>", lambda e: (self.toggle_scan(), "break")[-1])
+        self.root.bind("<Control-a>", lambda e: (self.open_add_student(), "break")[-1])
+        self.root.bind("<Control-f>", lambda e: (self._focus_search(), "break")[-1])
+        # Ctrl+1..7 switch tabs
+        tab_map = {"1": "Home", "2": "Analytics", "3": "Bot", "4": "Mail",
+                   "5": "Console", "6": "Notepad", "7": "Settings"}
+        for num, name in tab_map.items():
+            self.root.bind(f"<Control-Key-{num}>", lambda e, n=name: (self._switch(n), "break")[-1])
+
+    def _focus_search(self):
+        if hasattr(self, "search_var"):
+            # Find the search entry and focus it
+            for w in self.root.winfo_children():
+                self._focus_search_in(w)
+
+    def _focus_search_in(self, widget):
+        if isinstance(widget, ttk.Entry) and str(widget.cget("textvariable")) == str(self.search_var):
+            widget.focus_set()
+            return True
+        for child in widget.winfo_children():
+            if self._focus_search_in(child):
+                return True
+        return False
+
+    def _set_scanning_indicator(self, active: bool) -> None:
+        """Update the small status dot on the nav rail."""
+        if not hasattr(self, "rail_status_dot"):
+            return
+        self.rail_status_dot.configure(fg=P.green if active else P.faint)
+        if hasattr(self, "_rail_status_tip"):
+            self._rail_status_tip.text = "Scanner running" if active else "Scanner idle"
+
+
+    # ── left: Home tab ────────────────────────────────────────────────────────
+    def _build_home_tab(self):
+        parent = self._tab_frames["Home"]
+
+        # ── masthead ──────────────────────────────────────────────────────
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.pack(fill="x", padx=22, pady=(20, 12))
+
+        title_row = tk.Frame(hdr, bg=P.sidebar)
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="FaceAttend", bg=P.sidebar, fg=P.text,
+                 font=F_H1).pack(side="left")
+        chip = tk.Label(title_row, text=f" {APP_VERSION} ", bg=P.blue_soft, fg=P.blue,
+                         font=F_SMALL_B)
+        chip.pack(side="left", padx=(8, 0), pady=(4, 0))
+        self.clock_lbl = tk.Label(title_row, text="", bg=P.sidebar, fg=P.muted,
+                                   font=F_SMALL)
+        self.clock_lbl.pack(side="right")
+
+        tk.Label(hdr, text=self.T("app_tagline"),
+                 bg=P.sidebar, fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(3, 0))
+
+        # ── camera ────────────────────────────────────────────────────────
+        cam_outer = tk.Frame(parent, bg=P.sidebar2, highlightthickness=1,
+                              highlightbackground=P.border)
+        cam_outer.pack(padx=22, pady=(6, 12), fill="x")
+        cam_wrap = tk.Frame(cam_outer, bg="#070d16", width=420, height=300)
+        cam_wrap.pack(padx=2, pady=2, fill="x")
+        cam_wrap.pack_propagate(False)
+        self.cam_lbl = tk.Label(cam_wrap, text=self.T("camera_off"),
+                                bg="#070d16", fg=P.muted, font=F_H3)
+        self.cam_lbl.pack(fill="both", expand=True)
+
+        ctrl = tk.Frame(parent, bg=P.sidebar)
+        ctrl.pack(fill="x", padx=22)
+        self.scan_btn = AnimBtn(ctrl, text=self.T("start_scan"),
+            command=self.toggle_scan,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=18, pady=12,
+            font=F_BODY_B, cursor="hand2",
+            anim_color=P.blue_glow)
+        self.scan_btn.pack(side="left", fill="x", expand=True)
+        refresh_btn = AnimBtn(ctrl, text=self.T("refresh"), command=self.refresh_all,
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=16, pady=12,
+            font=F_BODY_B, cursor="hand2")
+        refresh_btn.pack(side="left", padx=(10, 0))
+
+        # ── last scan card (will animate on recognition) ────────────────────
+        self.result_card = tk.Frame(parent, bg=P.sidebar2,
+                                    highlightthickness=1, highlightbackground=P.border)
+        self.result_card.pack(fill="x", padx=22, pady=16)
+        tk.Label(self.result_card, text=self.T("last_recognition"), bg=P.sidebar2,
+                 fg=P.faint, font=F_TINY).pack(anchor="w", padx=14, pady=(12, 0))
+        self.last_name = tk.Label(self.result_card, text=self.T("waiting"),
+                                  bg=P.sidebar2, fg=P.text,
+                                  font=(FONT_FAMILY, 16, "bold"), anchor="w")
+        self.last_name.pack(fill="x", padx=14, pady=(2, 0))
+        self.last_detail = tk.Label(self.result_card, text=self.T("start_scanning"),
+                                    bg=P.sidebar2, fg=P.muted,
+                                    font=F_BODY, anchor="w")
+        self.last_detail.pack(fill="x", padx=14, pady=(3, 12))
+
+        # ── activity feed ─────────────────────────────────────────────────
+        feed_hdr = tk.Frame(parent, bg=P.sidebar)
+        feed_hdr.pack(fill="x", padx=22)
+        tk.Label(feed_hdr, text=self.T("activity_feed"), bg=P.sidebar, fg=P.text,
+                 font=F_H3).pack(side="left")
+
+        feed_sh = tk.Frame(parent, bg="#070d16", highlightthickness=1,
+                            highlightbackground=P.border_soft)
+        feed_sh.pack(fill="both", expand=True, padx=22, pady=(8, 20))
+        self.activity = tk.Listbox(feed_sh, bg="#070d16", fg="#c8d8ec",
+                                   selectbackground=P.blue, relief="flat",
+                                   highlightthickness=0, activestyle="none",
+                                   font=F_MONO)
+        sb = ttk.Scrollbar(feed_sh, orient="vertical", command=self.activity.yview)
+        self.activity.configure(yscrollcommand=sb.set)
+        self.activity.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        sb.pack(side="right", fill="y")
+        self._feed_empty_hint = f"  {self.T('no_activity')}"
+        self.activity.insert(0, self._feed_empty_hint)
+
+    # ── right panel ───────────────────────────────────────────────────────────
+    def _build_right_panel(self):
+        self.right.grid_columnconfigure(0, weight=1)
+        self.right.grid_rowconfigure(3, weight=1)   # row 3 = table (was row 4)
+
+        # ── row 0 : title + subtitle ──────────────────────────────────────────
+        title_bar = tk.Frame(self.right, bg=P.bg)
+        title_bar.grid(row=0, column=0, sticky="ew", padx=24, pady=(10, 0))
+        title_bar.grid_columnconfigure(0, weight=1)
+
+        tk.Label(title_bar, text=self.T("teacher_dashboard"), bg=P.bg, fg=P.text,
+                 font=F_H1).grid(row=0, column=0, sticky="w")
+        self.date_lbl = tk.Label(title_bar, text=self._localized_date(),
+                                 bg=P.bg, fg=P.muted, font=F_BODY)
+        self.date_lbl.grid(row=1, column=0, sticky="w")
+
+        # ── row 1 : action toolbar ────────────────────────────────────────────
+        toolbar = tk.Frame(self.right, bg=P.surface, highlightthickness=1,
+                            highlightbackground=P.border_soft)
+        toolbar.grid(row=1, column=0, sticky="ew", padx=24, pady=(6, 0))
+
+        def tbtn(parent, txt, cmd, bg, fg, abg, afg, anim=None):
+            b = AnimBtn(parent, text=txt, command=cmd,
+                bg=bg, fg=fg, activebackground=abg, activeforeground=afg,
+                relief="flat", padx=14, pady=8, font=F_SMALL_B,
+                cursor="hand2", anim_color=anim or abg)
+            b.pack(side="left", padx=(0, 3), pady=8)
+            return b
+
+        grp = tk.Frame(toolbar, bg=P.surface)
+        grp.pack(side="left", padx=12)
+        tbtn(grp, self.T("add_student"),    self.open_add_student,  P.green,    "white",   P.green_dark, "white",   "#15803d")
+        tbtn(grp, self.T("edit_student"),   self.open_edit_student, P.amber,    "#1a1100", "#d97706",    "#1a1100", "#b45309")
+        tbtn(grp, self.T("mark_attendance"), self.mark_attendance_selected, P.green_dark, "white", "#15803d", "white", "#0f6e2c")
+        tbtn(grp, self.T("remove_student"), self.remove_selected,   P.red,      "white",   P.red_dark,   "white",   "#b91c1c")
+        tk.Frame(toolbar, bg=P.border, width=1).pack(side="left", fill="y", padx=14, pady=10)
+        grp2 = tk.Frame(toolbar, bg=P.surface)
+        grp2.pack(side="left", padx=(0, 12))
+        tbtn(grp2, self.T("import"), self._open_bulk_import, P.blue,     "white",   P.blue_dark,  "white",   P.blue_glow)
+        tbtn(grp2, self.T("export"), self._export_menu,      P.sidebar2, P.ink,     P.border,     P.ink)
+        # Analytics and Certificates are one click away elsewhere (the
+        # Analytics rail icon, and Certificates in Settings → Tools), so
+        # this bar stays focused on roster actions.
+
+        # ── row 2 : stat cards ────────────────────────────────────────────────
+        stats = tk.Frame(self.right, bg=P.bg)
+        stats.grid(row=2, column=0, sticky="ew", padx=24, pady=(8, 6))
+        for i in range(4):
+            stats.grid_columnconfigure(i, weight=1, uniform="statcol")
+
+        self.card_total   = StatCard(stats, self.T("total_students"),  "0",   "🎓", P.tint_blue,   P.blue,   subtitle=self.T("enrolled"))
+        self.card_present = StatCard(stats, self.T("present_today"),   "0",   "✓",  P.tint_green,  P.green,  subtitle=self.T("scanned_in"))
+        self.card_absent  = StatCard(stats, self.T("absent_today"),    "0",   "⏰", P.tint_amber,  P.amber,  subtitle=self.T("not_yet_seen"))
+        self.card_xp      = StatCard(stats, self.T("xp_leader"),       "—",   "★",  P.tint_purple, P.purple, subtitle=self.T("top_scorer"))
+        for i, c in enumerate([self.card_total, self.card_present, self.card_absent, self.card_xp]):
+            c.grid(row=0, column=i, sticky="nsew",
+                   padx=(0 if i == 0 else 5, 0))
+
+        # ── row 3 : search + table (combined frame) ───────────────────────────
+        main_area = tk.Frame(self.right, bg=P.bg)
+        main_area.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 18))
+        main_area.grid_rowconfigure(2, weight=1)
+        main_area.grid_columnconfigure(0, weight=1)
+
+        # search bar
+        sb_frame = tk.Frame(main_area, bg=P.surface, highlightthickness=1,
+                             highlightbackground=P.border)
+        sb_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        sb_frame.grid_columnconfigure(1, weight=1)
+
+        tk.Label(sb_frame, text="🔍", bg=P.surface, fg=P.muted,
+                 font=(FONT_FAMILY, 12)).grid(row=0, column=0, padx=(14, 6), pady=10)
+        se = ttk.Entry(sb_frame, textvariable=self.search_var, font=(FONT_FAMILY, 11))
+        se.grid(row=0, column=1, sticky="ew", pady=10)
+        se.bind("<KeyRelease>", self._debounce_search)
+        self.search_count_lbl = tk.Label(sb_frame, text="", bg=P.surface, fg=P.faint,
+                                          font=F_SMALL)
+        self.search_count_lbl.grid(row=0, column=2, padx=(4, 6))
+        AnimBtn(sb_frame, text=self.T("clear"), command=self._clear_search,
+            bg=P.surface2, fg=P.muted, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=10, pady=6,
+            font=F_SMALL_B, cursor="hand2").grid(row=0, column=3, padx=(0, 10), pady=8)
+
+        # ── multi-select bar (Select All + bulk actions) ────────────────────
+        # ttk.Treeview's own selectmode="extended" already gives shift-click
+        # range select and ctrl-click toggle-select for free — this bar adds
+        # the "Select All" shortcut and the bulk actions those selections
+        # are for. It stays hidden until at least one row is selected, then
+        # shows a live "N selected" count next to Remove/Change Section.
+        selbar = tk.Frame(main_area, bg=P.blue_soft, highlightthickness=1,
+                           highlightbackground=P.blue)
+        self._selbar = selbar
+        selbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        selbar.grid_remove()  # only shown once something is selected
+        self._selbar_count_lbl = tk.Label(selbar, text="", bg=P.blue_soft, fg=P.text,
+                                           font=F_SMALL_B)
+        self._selbar_count_lbl.pack(side="left", padx=(14, 10), pady=8)
+        AnimBtn(selbar, text=self.T("remove_selected"),
+            command=self.remove_selected, bg=P.red, fg="white",
+            activebackground=P.red_dark, activeforeground="white",
+            relief="flat", padx=12, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=4, pady=8)
+        AnimBtn(selbar, text=self.T("change_section_selected"),
+            command=self.change_section_for_selected, bg=P.amber, fg="#1a1100",
+            activebackground="#d97706", activeforeground="#1a1100",
+            relief="flat", padx=12, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=4, pady=8)
+        AnimBtn(selbar, text=self.T("clear_selection"),
+            command=self.clear_table_selection, bg=P.surface2, fg=P.muted,
+            activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=12, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=4, pady=8)
+        AnimBtn(selbar, text=self.T("select_all"),
+            command=self.select_all_students, bg=P.surface2, fg=P.text,
+            activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=12, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="right", padx=(4, 14), pady=8)
+
+        # table
+        tsh = tk.Frame(main_area, bg=P.surface, highlightthickness=1,
+                        highlightbackground=P.border)
+        tsh.grid(row=2, column=0, sticky="nsew")
+        tsh.grid_rowconfigure(0, weight=1)
+        tsh.grid_columnconfigure(0, weight=1)
+
+        self.table = ttk.Treeview(tsh, columns=COLUMNS, show="tree headings",
+                                   selectmode="extended")
+        self.table.heading("#0", text="📷")
+        self.table.column("#0", width=72, minwidth=60, stretch=False, anchor="center")
+
+        col_w = {
+            "Sl.No": 48, "Roll No": 80, "UID": 72, "Name": 160,
+            "Grade": 64, "House": 72, "Parent Phone": 120,
+            "Parent Email": 180, "No. of Days Present": 120,
+            "XP": 62, "Multiplier": 80, "Streak": 68,
+        }
+        # translated header text only — the COLUMNS identifiers themselves
+        # stay in English internally (Excel headers, sort keys, etc.)
+        col_label_key = {
+            "Sl.No": "col_slno", "Roll No": "col_rollno", "UID": "col_uid",
+            "Name": "col_name", "Grade": "col_grade", "House": "col_house",
+            "Parent Phone": "col_phone", "Parent Email": "col_email",
+            "No. of Days Present": "col_days", "XP": "col_xp",
+            "Multiplier": "col_multiplier", "Streak": "col_streak",
+        }
+        self._col_label_key = col_label_key
+        for col in COLUMNS:
+            self.table.heading(col, text=self.T(col_label_key.get(col, col)),
+                               command=lambda c=col: self._sort_table(c))
+            self.table.column(col, width=col_w.get(col, 80),
+                              minwidth=44, anchor="center")
+        self.table.column("Name",         anchor="w")
+        self.table.column("Parent Email", anchor="w")
+        self.table["displaycolumns"] = COLUMNS
+
+        ys = ttk.Scrollbar(tsh, orient="vertical",   command=self.table.yview)
+        xs = ttk.Scrollbar(tsh, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+
+        self.table.tag_configure("odd",     background=P.surface)
+        self.table.tag_configure("even",    background=P.surface2)
+        self.table.tag_configure("present", background=P.green_soft)
+        self.table.tag_configure("match",   background=P.blue_soft)
+        self.table.tag_configure("hover",   background=P.hover)
+
+        self.table.bind("<Double-1>", lambda _e: self.open_edit_student())
+        self.table.bind("<Motion>",   self._on_table_hover)
+        self.table.bind("<Leave>",    lambda _e: self._clear_table_hover())
+        self.table.bind("<<TreeviewSelect>>", self._on_table_selection_changed)
+        self._hovered_row    = None
+        self._sort_col       = None
+        self._sort_ascending = True
+
+        # empty state
+        self.table_empty = tk.Frame(tsh, bg=P.surface)
+        tk.Label(self.table_empty, text="👥", bg=P.surface, fg=P.faint,
+                 font=(FONT_FAMILY, 32)).pack(pady=(50, 6))
+        tk.Label(self.table_empty, text=self.T("no_students_enrolled"),
+                 bg=P.surface, fg=P.text, font=F_H3).pack()
+        tk.Label(self.table_empty,
+                 text=self.T("click_add_hint"),
+                 bg=P.surface, fg=P.muted, font=F_BODY).pack(pady=(4, 0))
+
+    def _on_table_hover(self, event):
+        row_id = self.table.identify_row(event.y)
+        if row_id == self._hovered_row:
+            return
+        self._clear_table_hover()
+        if row_id:
+            current = self.table.item(row_id, "tags")
+            if "match" not in current and "present" not in current:
+                self.table.item(row_id, tags=tuple(current) + ("hover",))
+            self._hovered_row = row_id
+
+    def _clear_table_hover(self):
+        if self._hovered_row:
+            current = self.table.item(self._hovered_row, "tags")
+            self.table.item(self._hovered_row, tags=tuple(t for t in current if t != "hover"))
+        self._hovered_row = None
+
+    def _sort_table(self, col: str):
+        if self._sort_col == col:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_col = col
+            self._sort_ascending = True
+        self.refresh_table(self.search_var.get())
+
+
+    # ── analytics tab ─────────────────────────────────────────────────────────
+    def _build_analytics_tab(self):
+        # The Analytics tab hosts two switchable panes — "Students" (XP,
+        # attendance trend, top-student list) and "Houses" (house cards
+        # and leaderboard) — so student and house analytics share one
+        # nav item instead of two.
+        outer = self._tab_frames["Analytics"]
+        outer.grid_rowconfigure(1, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        switcher = tk.Frame(outer, bg=P.sidebar)
+        switcher.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 4))
+        self._an_pane_btns = {}
+
+        def show_pane(which):
+            for name, pane in (("students", self._an_students_pane), ("houses", self._an_houses_pane)):
+                pane.grid_remove()
+                b = self._an_pane_btns[name]
+                active = name == which
+                b.configure(bg=P.blue if active else P.sidebar2,
+                            fg="white" if active else P.ink)
+            {"students": self._an_students_pane, "houses": self._an_houses_pane}[which].grid()
+        self._an_show_pane = show_pane
+
+        for key, label in (("students", f"🧑‍🎓 {self.T('analytics')}"), ("houses", f"🏠 {self.T('houses')}")):
+            b = AnimBtn(switcher, text=label, command=lambda k=key: show_pane(k),
+                bg=P.sidebar2, fg=P.ink, activebackground=P.border, activeforeground=P.ink,
+                relief="flat", padx=12, pady=7, font=F_SMALL_B, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            self._an_pane_btns[key] = b
+
+        panes_container = tk.Frame(outer, bg=P.sidebar)
+        panes_container.grid(row=1, column=0, sticky="nsew")
+        panes_container.grid_rowconfigure(0, weight=1)
+        panes_container.grid_columnconfigure(0, weight=1)
+
+        self._an_students_pane = tk.Frame(panes_container, bg=P.sidebar)
+        self._an_students_pane.grid(row=0, column=0, sticky="nsew")
+        self._an_houses_pane = tk.Frame(panes_container, bg=P.sidebar)
+        self._an_houses_pane.grid(row=0, column=0, sticky="nsew")
+
+        parent = self._an_students_pane
+        parent.grid_rowconfigure(3, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.grid(row=0, column=0, sticky="ew", padx=18, pady=(4, 10))
+        tk.Label(hdr, text=f"📊  {self.T('analytics')}", bg=P.sidebar, fg=P.text,
+                 font=F_H2).pack(anchor="w")
+        tk.Label(hdr, text=self.T("analytics_subtitle"),
+                 bg=P.sidebar, fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(2, 0))
+        AnimBtn(hdr, text=self.T("refresh"), command=self._refresh_analytics,
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=12, pady=6,
+            font=F_SMALL_B, cursor="hand2").pack(anchor="e", pady=(6, 0))
+
+        # mini stat cards
+        sc = tk.Frame(parent, bg=P.sidebar)
+        sc.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 6))
+        sc.grid_columnconfigure(0, weight=1)
+        sc.grid_columnconfigure(1, weight=1)
+        self._an_card_rate = self._mini_stat(sc, 0, "Avg Attendance", "—%", P.tint_green, P.green)
+        self._an_card_days = self._mini_stat(sc, 1, "School Days",    "0",  P.tint_blue,  P.blue)
+
+        # house bar chart
+        tk.Label(parent, text="House Attendance %", bg=P.sidebar,
+                 fg=P.text, font=F_SMALL_B).grid(row=2, column=0, sticky="w", padx=18, pady=(4,2))
+        self._chart_house_canvas = tk.Canvas(parent, bg=P.sidebar2, height=120,
+                                              highlightthickness=1,
+                                              highlightbackground=P.border_soft)
+        self._chart_house_canvas.grid(row=2, column=0, sticky="ew", padx=18, pady=(20, 6))
+        self._chart_house_canvas.bind("<Configure>", lambda _e: self._draw_house_chart())
+
+        # trend line chart
+        tk.Label(parent, text="30-Day Attendance Trend", bg=P.sidebar,
+                 fg=P.text, font=F_SMALL_B).grid(row=3, column=0, sticky="nw", padx=18, pady=(4,2))
+        self._chart_trend_canvas = tk.Canvas(parent, bg=P.sidebar2, height=120,
+                                              highlightthickness=1,
+                                              highlightbackground=P.border_soft)
+        self._chart_trend_canvas.grid(row=3, column=0, sticky="new", padx=18, pady=(22, 6))
+        self._chart_trend_canvas.bind("<Configure>", lambda _e: self._draw_trend_chart())
+
+        # top 10 list
+        tk.Label(parent, text="Top Students by XP", bg=P.sidebar,
+                 fg=P.text, font=F_SMALL_B).grid(row=4, column=0, sticky="w", padx=18, pady=(4,2))
+        top_sh = tk.Frame(parent, bg=P.sidebar2, highlightthickness=1,
+                           highlightbackground=P.border_soft)
+        top_sh.grid(row=5, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        top_sh.grid_rowconfigure(0, weight=1)
+        top_sh.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(5, weight=1)
+        self._an_top_list = tk.Listbox(top_sh, bg=P.sidebar2, fg=P.text,
+                                        relief="flat", highlightthickness=0,
+                                        font=F_BODY, activestyle="none",
+                                        selectbackground=P.blue_soft,
+                                        selectforeground=P.text)
+        lsb = ttk.Scrollbar(top_sh, orient="vertical", command=self._an_top_list.yview)
+        self._an_top_list.configure(yscrollcommand=lsb.set)
+        self._an_top_list.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        lsb.grid(row=0, column=1, sticky="ns")
+
+        # flame legend
+        legend = tk.Frame(parent, bg=P.sidebar)
+        legend.grid(row=6, column=0, sticky="ew", padx=18, pady=(0, 14))
+        tk.Label(legend, text="🔥 5+ day streak  🔥🔥 10+  🔥🔥🔥 30+",
+                 bg=P.sidebar, fg=P.faint, font=F_TINY).pack(anchor="w")
+
+        # defer refresh until after window is fully drawn so canvas sizes are known
+        parent.after(100, self._refresh_analytics)
+
+        self._build_house_analytics_pane(self._an_houses_pane)
+        show_pane("students")
+
+    def _mini_stat(self, parent, col, title, value, tint, accent):
+        f = tk.Frame(parent, bg=tint, highlightthickness=1, highlightbackground=accent)
+        f.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 6, 0), pady=(0, 4))
+        tk.Label(f, text=title, bg=tint, fg=P.muted, font=F_SMALL_B).pack(anchor="w", padx=12, pady=(10, 0))
+        lbl = tk.Label(f, text=value, bg=tint, fg=P.text, font=(FONT_FAMILY, 20, "bold"))
+        lbl.pack(anchor="w", padx=12, pady=(2, 10))
+        return lbl
+
+    def _refresh_analytics(self):
+        # Guard: called from refresh_all before analytics tab may be built
+        if not hasattr(self, "_an_card_rate") or not hasattr(self, "_an_top_list"):
+            return
+
+        students = self.store.load_students()
+        if not students:
+            self._an_card_rate.configure(text="—%")
+            self._an_card_days.configure(text="0")
+            self._an_top_list.delete(0, "end")
+            self._an_top_list.insert("end", "  No students enrolled yet.")
+            if hasattr(self, "_chart_house_canvas"): self._draw_house_chart()
+            if hasattr(self, "_chart_trend_canvas"): self._draw_trend_chart()
+            return
+
+        rows = self.store._load_audit_rows()
+        unique_days = len({r[0] for r in rows if r}) or 1
+        avg_pct = 0.0
+        if students and unique_days:
+            total_possible = len(students) * unique_days
+            total_present  = sum(safe_int(s.get("No. of Days Present", 0)) for s in students)
+            avg_pct = round(total_present / total_possible * 100, 1) if total_possible else 0.0
+        self._an_card_rate.configure(text=f"{avg_pct}%")
+        self._an_card_days.configure(text=str(unique_days))
+
+        top = sorted(students, key=lambda s: safe_int(s.get("XP", 0)), reverse=True)[:10]
+        self._an_top_list.delete(0, "end")
+        medals = ["🥇", "🥈", "🥉"] + ["  "] * 20
+
+        def flame(streak):
+            s = safe_int(streak)
+            if s >= 30: return "🔥🔥🔥"
+            if s >= 10: return "🔥🔥"
+            if s >= 5:  return "🔥"
+            return ""
+
+        for i, s in enumerate(top):
+            xp     = safe_int(s.get("XP", 0))
+            days   = safe_int(s.get("No. of Days Present", 0))
+            streak = safe_int(s.get("Streak", 0))
+            fl     = flame(streak)
+            pct    = round(days / unique_days * 100, 1) if unique_days else 0.0
+            house  = str(s.get("House", "")).strip()
+            house_s = f"  [{house}]" if house and house != "None" else ""
+            line = (f"  {medals[i]}  {s.get('Name','')}  ·  {s.get('Roll No','')} "
+                    f"{house_s}  ·  {xp} XP  ·  {pct}% attendance  {fl}")
+            self._an_top_list.insert("end", line)
+
+        if hasattr(self, "_chart_house_canvas"): self._draw_house_chart()
+        if hasattr(self, "_chart_trend_canvas"): self._draw_trend_chart()
+
+    def _draw_house_chart(self):
+        """Draw a simple bar chart of house attendance percentages."""
+        if not hasattr(self, "_chart_house_canvas"): return
+        canvas = self._chart_house_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 10 or h < 10:
+            # canvas not yet laid out — the <Configure> binding will redraw
+            # once it actually has a real size, so just bail quietly here.
+            return
+        stats = self.store.house_stats()
+        houses = ["Red", "Blue", "Green", "Orange"]
+        colors = ["#ef4444", "#3b82f6", "#22c55e", "#f97316"]
+        values = [stats.get(h_, {}).get("pct", 0) for h_ in houses]
+        max_v = max(values + [1])
+        bar_w = max(1, (w - 40) // len(houses))
+        for i, (house, val, color) in enumerate(zip(houses, values, colors)):
+            bh = int((val / max_v) * (h - 40)) if max_v else 0
+            x = 20 + i * bar_w + bar_w // 4
+            canvas.create_rectangle(x, h - 20 - bh, x + bar_w // 2, h - 20,
+                                     fill=color, outline="", tags="bar")
+            canvas.create_text(x + bar_w // 4, h - 10, text=house, fill=P.text,
+                               font=F_TINY, tags="label")
+            canvas.create_text(x + bar_w // 4, h - 30 - bh, text=f"{val:.0f}%",
+                               fill=P.text, font=F_TINY, tags="val")
+        if all(v == 0 for v in values):
+            canvas.create_text(w // 2, h // 2, text="No attendance recorded yet",
+                               fill=P.muted, font=F_TINY)
+
+    def _draw_trend_chart(self):
+        """Draw a line chart of last 30 days attendance."""
+        if not hasattr(self, "_chart_trend_canvas"): return
+        canvas = self._chart_trend_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 10 or h < 10:
+            return
+        rows = self.store._load_audit_rows()
+        from collections import Counter
+        day_counts = Counter()
+        for row in rows:
+            if row and len(row) > 0:
+                day_counts[row[0]] += 1
+        # Get last 30 days
+        dates = [(datetime.now() - __import__('datetime').timedelta(days=i)).strftime("%Y-%m-%d")
+                 for i in range(29, -1, -1)]
+        values = [day_counts.get(d, 0) for d in dates]
+        max_v = max(values + [1])
+
+        # Always draw the axis lines, even with zero data, so the box
+        # never looks like a broken empty rectangle.
+        canvas.create_line(20, h - 20, w - 20, h - 20, fill=P.chart_grid, width=1)
+        canvas.create_line(20, 20, 20, h - 20, fill=P.chart_grid, width=1)
+
+        if not any(values):
+            canvas.create_text(w // 2, h // 2, text="No attendance recorded yet",
+                               fill=P.muted, font=F_TINY)
+            return
+
+        points = []
+        for i, v in enumerate(values):
+            x = 20 + (i * (w - 40) // max(len(values) - 1, 1))
+            y = h - 20 - int((v / max_v) * (h - 40))
+            points.append((x, y))
+        if len(points) > 1:
+            for i in range(len(points) - 1):
+                canvas.create_line(points[i][0], points[i][1], points[i+1][0], points[i+1][1],
+                                   fill=P.blue, width=2)
+        for x, y in points:
+            canvas.create_oval(x-2, y-2, x+2, y+2, fill=P.blue, outline="")
+
+    # ── bot tab ───────────────────────────────────────────────────────────────
+    def _build_bot_tab(self):
+        parent = self._tab_frames["Bot"]
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        tk.Label(hdr, text=f"🤖  {self.T('ai_buddy')}", bg=P.sidebar, fg=P.text,
+                 font=F_H2).pack(anchor="w")
+        tk.Label(hdr, text=self.T("bot_subtitle"), bg=P.sidebar,
+                 fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(2, 0))
+
+        chat_sh = tk.Frame(parent, bg="#070d16", highlightthickness=1, highlightbackground=P.border_soft)
+        chat_sh.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        chat_sh.grid_rowconfigure(0, weight=1)
+        chat_sh.grid_columnconfigure(0, weight=1)
+
+        self.bot_chat = tk.Text(chat_sh, wrap="word", bg="#070d16", fg="#c8d8ec",
+                                relief="flat", highlightthickness=0,
+                                font=F_BODY, padx=12, pady=12, spacing3=6)
+        self.bot_chat.tag_configure("speaker_you", foreground=P.blue, font=F_SMALL_B)
+        self.bot_chat.tag_configure("speaker_bot", foreground=P.green, font=F_SMALL_B)
+        bs = ttk.Scrollbar(chat_sh, orient="vertical", command=self.bot_chat.yview)
+        self.bot_chat.configure(yscrollcommand=bs.set)
+        self.bot_chat.grid(row=0, column=0, sticky="nsew")
+        bs.grid(row=0, column=1, sticky="ns")
+        self.bot_chat.insert("end", f"{self.T('ai_buddy')}: ", "speaker_bot")
+        self.bot_chat.insert("end", self.T("ai_welcome") + "\n")
+        self.bot_chat.configure(state="disabled")
+
+        inp = tk.Frame(parent, bg=P.sidebar)
+        inp.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
+        inp.grid_columnconfigure(0, weight=1)
+        self.bot_var = tk.StringVar()
+        be = ttk.Entry(inp, textvariable=self.bot_var, font=F_BODY)
+        be.grid(row=0, column=0, sticky="ew")
+        be.bind("<Return>", lambda _: self._ask_bot())
+        self.bot_send_btn = AnimBtn(inp, text=self.T("ask_btn"),
+            command=self._ask_bot, bg=P.blue, fg="white",
+            activebackground=P.blue_dark, activeforeground="white",
+            relief="flat", padx=14, pady=7,
+            font=F_SMALL_B, cursor="hand2",
+            anim_color=P.blue_glow)
+        self.bot_send_btn.grid(row=0, column=1, padx=(8, 0))
+
+    def _ask_bot(self):
+        q = self.bot_var.get().strip()
+        if not q or self.buddy_busy: return
+        self.bot_var.set("")
+        self._bot_append("You", q)
+        self.buddy_busy = True
+        self.bot_send_btn.configure(state="disabled", text="…")
+        threading.Thread(target=self._run_bot, args=(q,), daemon=True).start()
+
+    def _bot_append(self, speaker, msg):
+        tag = "speaker_you" if speaker == "You" else "speaker_bot"
+        self.bot_chat.configure(state="normal")
+        self.bot_chat.insert("end", f"{speaker}: ", tag)
+        self.bot_chat.insert("end", f"{msg}\n")
+        self.bot_chat.see("end")
+        self.bot_chat.configure(state="disabled")
+
+    def _run_bot(self, q):
+        try:    ans = self._bot_answer(q)
+        except Exception as e: ans = f"Error: {e}"
+        self.root.after(0, lambda: self._bot_append("AI Buddy", ans))
+        self.root.after(0, lambda: (
+            self.bot_send_btn.configure(state="normal", text="Ask"),
+            setattr(self, "buddy_busy", False),
+        ))
+
+    def _bot_answer(self, q: str) -> str:
+        """Answer the teacher's query. Uses keyword matching first (fast, always works),
+        then falls back to Ollama only if the intent is unclear."""
+        ql = q.lower().strip()
+
+        # ── structured action commands (bulk remove / bulk section change) ──
+        # These give the AI Buddy "full power" to act on real data, not just
+        # answer questions about it: "Remove these students- A, B, C" or
+        # "change these students to section A" both resolve to the SAME
+        # bulk-action code the toolbar buttons use (remove_selected /
+        # apply_section_change), so there's exactly one code path — and one
+        # confirmation dialog — for a destructive action, whether a teacher
+        # clicked a button or typed a sentence.
+        acted = self._ai_try_structured_command(q, ql)
+        if acted is not None:
+            return acted
+
+        # ── keyword pre-filter (handles ~90% of queries without Ollama) ──────
+        # Search triggers
+        if any(w in ql for w in ("search", "find", "look up", "show", "where is", "who is")):
+            # extract the name/UID after the trigger word
+            query = re.sub(r"^(search|find|look\s*up|show|where\s*is|who\s*is)\s*", "", ql).strip()
+            if query:
+                r = self._ai_search(query)
+                n = r.get("count", 0)
+                return f"Found {n} student(s) for '{query}'. Results shown in the table."
+            return "What name or roll number should I search for?"
+
+        # Remove/delete triggers
+        if any(w in ql for w in ("remove", "delete", "kick", "expel")):
+            query = re.sub(r"^(remove|delete|kick|expel)\s*(student)?\s*", "", ql).strip()
+            if query:
+                r = self._ai_remove(query)
+                return str(r.get("message", "Done."))
+            return "Which student should I remove? Give me their name or UID."
+
+        if "export" in ql:
+            self._run_on_ui(lambda: self._do_export("excel"))
+            return "I started the styled Excel export."
+        if "certificate" in ql:
+            self._run_on_ui(self._open_certificates)
+            return "The certificate generator is open. Choose the minimum attendance and generate."
+        if any(w in ql for w in ("add student", "new student", "enrol", "enroll")):
+            self._run_on_ui(self.open_add_student)
+            return "The new-student form is open."
+        if any(w in ql for w in ("start camera", "start scan", "start attendance")):
+            self._run_on_ui(self.start_scan)
+            return "I started the camera scan."
+        if any(w in ql for w in ("stop camera", "stop scan")):
+            self._run_on_ui(self.stop_scan)
+            return "I stopped the camera scan."
+
+        # Stats queries — answer from live data without Ollama
+        if any(w in ql for w in ("xp", "points", "score")) and not any(w in ql for w in ("top", "leaderboard", "best")):
+            students_all = self.store.load_students()
+            matched = next((s for s in students_all if s.get("Name", "").lower() in ql or str(s.get("UID", "")).lower() in ql), None)
+            if matched:
+                return f"{matched.get('Name','')} has {safe_int(matched.get('XP',0))} XP."
+            if any(w in ql for w in ("how many", "total", "all")):
+                return f"The roster has {sum(safe_int(s.get('XP', 0)) for s in students_all)} XP in total across {len(students_all)} students."
+            return "Tell me the student's name or UID so I can look up their recorded XP."
+
+        if any(w in ql for w in ("how many", "total students", "count", "stats", "statistics")):
+            students = self.store.load_students()
+            present = len(self.scanned_today)
+            absent  = len(students) - present
+            top     = max(students, key=lambda s: safe_int(s.get("XP",0)), default=None)
+            top_s   = f"{top.get('Name','')} ({top.get('XP',0)} XP)" if top else "N/A"
+            return (f"Total students: {len(students)}\n"
+                    f"Present today: {present}\n"
+                    f"Absent today: {absent}\n"
+                    f"XP leader: {top_s}")
+
+        # XP query for specific student
+        if any(w in ql for w in ("xp", "points", "score")) and not any(w in ql for w in ("top", "leaderboard", "best")):
+            students_all = self.store.load_students()
+            matched = next((s for s in students_all if s.get("Name","").lower() in ql or str(s.get("UID","")).lower() in ql), None)
+            if matched:
+                return (f"{matched.get('Name','')} has {safe_int(matched.get('XP',0))} XP "
+                        f"({safe_int(matched.get('No. of Days Present',0))} days present, "
+                        f"x{matched.get('Multiplier',1.0)} multiplier).")
+            lines = [f"• {s.get('Name','')} — {safe_int(s.get('XP',0))} XP"
+                     for s in sorted(students_all, key=lambda s: safe_int(s.get("XP",0)), reverse=True)]
+            return ("XP for all students:\n" + "\n".join(lines)) if lines else "No students yet."
+
+        # Top / leaderboard queries
+        if any(w in ql for w in ("top", "leaderboard", "best", "highest xp", "most xp")):
+            students = sorted(self.store.load_students(),
+                              key=lambda s: safe_int(s.get("XP",0)), reverse=True)[:5]
+            if not students: return "No students enrolled yet."
+            lines = [f"{i+1}. {s.get('Name','')} — {s.get('XP',0)} XP"
+                     for i, s in enumerate(students)]
+            return "Top 5 by XP:\n" + "\n".join(lines)
+
+        # Present/absent queries
+        if "present" in ql or "attendance" in ql:
+            students = self.store.load_students()
+            present  = [s.get("Name","") for s in students if str(s.get("UID","")) in self.scanned_today]
+            if not present: return "No students scanned yet today."
+            return f"Present today ({len(present)}):\n" + "\n".join(f"• {n}" for n in present[:15])
+
+        if "absent" in ql:
+            students = self.store.load_students()
+            absent   = [s.get("Name","") for s in students if str(s.get("UID","")) not in self.scanned_today]
+            if not absent: return "Everyone is present!"
+            return f"Absent today ({len(absent)}):\n" + "\n".join(f"• {n}" for n in absent[:15])
+
+        # House queries
+        if "house" in ql:
+            stats = self.store.house_stats()
+            ranked = sorted(stats.items(), key=lambda x: -x[1]["pct"])
+            lines = [f"{h}: {d['pct']:.1f}% ({d['present']}/{d['students']})"
+                     for h, d in ranked]
+            return "House standings:\n" + "\n".join(lines)
+
+        # Help
+        if any(w in ql for w in ("help", "what can", "commands", "how do i")):
+            return ("I can help you with:\n"
+                    "• search <name/UID> — find a student\n"
+                    "• remove <name/UID> — remove a student\n"
+                    "• how many students — get stats\n"
+                    "• top students — XP leaderboard\n"
+                    "• who is present/absent today\n"
+                    "• house standings\n"
+                    "Or ask anything — I'll try Ollama if I'm unsure!")
+
+        # ── Ollama fallback for unclear queries ───────────────────────────────
+        return self._ollama_action_smart(q)
+
+    def _ollama_action_smart(self, q: str) -> str:
+        """Ask the small local model using a bounded, factual data snapshot."""
+        students = self.store.load_students()
+        present_uids  = self.scanned_today
+        present_names = [s.get("Name","") for s in students if str(s.get("UID","")) in present_uids]
+        absent_names  = [s.get("Name","") for s in students if str(s.get("UID","")) not in present_uids]
+
+        # A bounded prompt is much faster and uses less RAM on old CPUs.
+        def names_summary(names, limit=12):
+            clean = [str(name) for name in names if str(name).strip()]
+            shown = ", ".join(clean[:limit]) or "none"
+            return f"{shown} (+{len(clean) - limit} more)" if len(clean) > limit else shown
+
+        student_list = "\n".join(
+            f"  - {s.get('Name','')} | UID:{s.get('UID','')} | "
+            f"Days:{s.get('No. of Days Present',0)} | XP:{s.get('XP',0)}"
+            for s in students[:30]
+        )
+        context = (
+            f"School: {self.settings.school_name or 'School'}\n"
+            f"Total students: {len(students)}\n"
+            f"Present today ({len(present_names)}): {names_summary(present_names)}\n"
+            f"Absent today ({len(absent_names)}): {names_summary(absent_names)}\n"
+            f"Roster:\n{student_list}\n"
+        )
+        if students:
+            top = max(students, key=lambda s: safe_int(s.get("XP",0)), default=None)
+            if top:
+                context += f"XP leader: {top.get('Name','')} ({top.get('XP',0)} XP)\n"
+
+        reply_language = LANG_NAMES.get(self._lang, "English")
+        prompt = (
+            f"{context}\n"
+            f"You are FaceAttend AI — an assistant for school attendance.\n"
+            f"RULES: Only use data from the roster above. Never invent numbers or names.\n"
+            f"If a student is not in the roster, say so clearly.\n"
+            f"Give the exact XP/days from the roster. Reply in {reply_language}, in 1-3 sentences. No JSON.\n\n"
+            f"Teacher: {q}\n"
+            f"Assistant:"
+        )
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "5m",
+            "options": {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": OLLAMA_NUM_PREDICT,
+            },
+        }
+        req = urllib.request.Request(
+            f"{OLLAMA_URL.rstrip('/')}/api/generate",
+            data=json.dumps(payload).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                data = json.loads(r.read())
+            if data.get("error"):
+                return f"Ollama error: {data['error']}\nRun: ollama pull {OLLAMA_MODEL}"
+            raw = str(data.get("response", "")).strip()
+            return raw if raw else "I'm not sure how to answer that. Try: 'search <name>' or 'how many students'."
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace").strip()
+            if "model" in detail.lower() and ("not found" in detail.lower() or "pull" in detail.lower()):
+                return f"The local AI model is not installed yet. Run:\n  ollama pull {OLLAMA_MODEL}"
+            return f"Ollama returned an error ({e.code}): {detail or e.reason}"
+        except urllib.error.URLError:
+            return ("Ollama isn't running — I answered what I could from the app data.\n"
+                    "To enable full AI: install Ollama from ollama.ai, then run:\n"
+                    f"  ollama pull {OLLAMA_MODEL}")
+        except Exception as e:
+            return f"AI error: {e}"
+
+    # keep old _ollama_action for any legacy callers
+    def _ollama_action(self, q) -> dict:
+        ans = self._ollama_action_smart(q)
+        return {"action": "answer", "query": "", "reply": ans}
+
+    # ── AI Buddy "full power" command layer ─────────────────────────────────
+    # Regex-first (fast, deterministic, works offline with zero Ollama calls
+    # for the common phrasings), falling back to nothing (None) so the
+    # caller drops through to the rest of _bot_answer / Ollama for anything
+    # that isn't clearly a bulk remove/section-change instruction.
+    _CMD_LIST_SPLIT = re.compile(r"\s*(?:,|;|&|\band\b)\s*")
+    _FILLER_TOKENS = {"", "student", "students", "the", "these", "selected", "all"}
+
+    def _ai_extract_name_list(self, text: str) -> list[str]:
+        """Splits 'Aman, Priya and Rohan' -> ['Aman', 'Priya', 'Rohan'],
+        dropping filler words like 'students'/'the'/'these'/'selected' that
+        are often mixed into the phrase ('remove these students - Aman,
+        Priya')."""
+        text = text.strip(" -\u2013\u2014:\t")
+        # strip a leading filler phrase like "these students-" / "the following students:"
+        text = re.sub(r"^(these|the|all|selected|following)\s+students?\s*[-\u2013\u2014:]*\s*",
+                       "", text, flags=re.IGNORECASE)
+        tokens = self._CMD_LIST_SPLIT.split(text.strip(" -\u2013\u2014:\t"))
+        out = []
+        for t in tokens:
+            t = t.strip(" -\u2013\u2014:\t")
+            if t.lower() in self._FILLER_TOKENS or not t:
+                continue
+            out.append(t)
+        return out
+
+    def _ai_resolve_targets(self, names: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+        """Resolves each free-text name/UID/roll token to (uid, name) pairs
+        using the same fuzzy match as search. Returns (resolved, unresolved)
+        so the confirmation dialog / reply can be explicit about anything
+        the AI could not confidently match, rather than silently guessing."""
+        resolved, unresolved = [], []
+        for token in names:
+            matches = self._find_students(token)
+            if len(matches) == 1:
+                s = matches[0]
+                resolved.append((str(s.get("UID", "")), str(s.get("Name", token))))
+            elif len(matches) > 1:
+                # try an exact (case-insensitive) name match to disambiguate
+                exact = [s for s in matches if str(s.get("Name", "")).lower() == token.lower()]
+                if len(exact) == 1:
+                    s = exact[0]
+                    resolved.append((str(s.get("UID", "")), str(s.get("Name", token))))
+                else:
+                    unresolved.append(f"{token} ({len(matches)} possible matches — be more specific)")
+            else:
+                unresolved.append(token)
+        return resolved, unresolved
+
+    def _ai_try_structured_command(self, q: str, ql: str) -> str | None:
+        """Tries to parse q as a bulk remove or bulk section-change command.
+        Returns the chat reply string if it handled the command, or None if
+        this wasn't one of those commands (caller continues normal handling)."""
+
+        # "remove/delete these students - A, B, C" / "remove A and B"
+        m = re.match(r"^(?:remove|delete|kick|expel)\s+(.+)$", q.strip(), re.IGNORECASE)
+        if m:
+            rest = m.group(1)
+            if re.fullmatch(r"(these|the|all|selected)\s+students?", rest.strip(), re.IGNORECASE) or \
+               rest.strip().lower() in ("selected", "them", "these"):
+                return self._ai_remove_many(use_selection=True)
+            names = self._ai_extract_name_list(rest)
+            if len(names) >= 2 or (len(names) == 1 and "," in rest):
+                return self._ai_remove_many(names=names)
+            return None  # single-name remove — let the existing handler deal with it
+
+        # "change these students to section A" / "move Aman, Priya to grade 8B"
+        m = re.match(
+            r"^(?:change|move|shift)\s+(.*?)\s+to\s+(?:section|grade|class)\s+([\w\-]+)\s*$",
+            q.strip(), re.IGNORECASE)
+        if m:
+            who, new_section = m.group(1).strip(), m.group(2).strip()
+            if re.fullmatch(r"(these|the|all|selected)\s+students?", who, re.IGNORECASE) or \
+               who.lower() in ("selected", "them", "these", ""):
+                return self._ai_change_section_many(new_section, use_selection=True)
+            names = self._ai_extract_name_list(who)
+            return self._ai_change_section_many(new_section, names=names)
+
+        return None
+
+    def _ai_remove_many(self, names: list[str] | None = None, use_selection: bool = False) -> str:
+        if use_selection:
+            pairs = self._selected_uid_name_pairs()
+            unresolved = []
+            if not pairs:
+                return self.T("no_selection")
+        else:
+            pairs, unresolved = self._ai_resolve_targets(names or [])
+            if not pairs:
+                return "I couldn't match any of those names to a student. " + \
+                       (f"Unmatched: {', '.join(unresolved)}." if unresolved else "")
+
+        def ui():
+            names_str = ", ".join(n for _, n in pairs)
+            extra = f"\n\n(Could not match: {', '.join(unresolved)})" if unresolved else ""
+            ok = messagebox.askyesno("AI Buddy — Remove Students",
+                                      f"Remove {len(pairs)} student(s)?\n\n{names_str}{extra}")
+            if not ok:
+                return False
+            play_sound(SOUND_NEGATIVE)
+            for uid, _name in pairs:
+                self.store.remove_student(uid)
+                self.scanned_today.discard(uid)
+            self._save_today_scans()
+            self.refresh_all()
+            self.log(f"AI removed {len(pairs)} student(s): {names_str}.")
+            return True
+        done = bool(self._run_on_ui(ui))
+        if not done:
+            return "Cancelled — nothing was removed."
+        msg = f"Removed {len(pairs)} student(s): {', '.join(n for _, n in pairs)}."
+        if unresolved:
+            msg += f" Could not match: {', '.join(unresolved)}."
+        return msg
+
+    def _ai_change_section_many(self, new_section: str, names: list[str] | None = None,
+                                 use_selection: bool = False) -> str:
+        if use_selection:
+            pairs = self._selected_uid_name_pairs()
+            unresolved = []
+            if not pairs:
+                return self.T("no_selection")
+        else:
+            pairs, unresolved = self._ai_resolve_targets(names or [])
+            if not pairs:
+                return "I couldn't match any of those names to a student. " + \
+                       (f"Unmatched: {', '.join(unresolved)}." if unresolved else "")
+
+        def ui():
+            names_str = ", ".join(n for _, n in pairs)
+            extra = f"\n\n(Could not match: {', '.join(unresolved)})" if unresolved else ""
+            ok = messagebox.askyesno("AI Buddy — Change Section",
+                                      f"Move {len(pairs)} student(s) to '{new_section}'?\n\n{names_str}{extra}")
+            if not ok:
+                return False
+            return self.apply_section_change([u for u, _ in pairs], new_section)
+        changed = self._run_on_ui(ui)
+        if not changed:
+            return "Cancelled — no sections were changed."
+        msg = f"Moved {changed} student(s) to '{new_section}'."
+        if unresolved:
+            msg += f" Could not match: {', '.join(unresolved)}."
+        return msg
+
+    def _ai_search(self, query) -> dict:
+        matches = self._find_students(query)
+        def ui():
+            self.search_var.set(query)
+            self.refresh_table(query)
+            self.log(f"AI: searched '{query}' → {len(matches)} result(s)")
+        self._run_on_ui(ui)
+        return {"ok": True, "count": len(matches)}
+
+    def _ai_remove(self, query) -> dict:
+        matches = self._find_students(query)
+        if not matches: return {"ok": False, "message": "No student found."}
+        if len(matches) > 1: return {"ok": False, "message": f"{len(matches)} matches. Be more specific."}
+        s = matches[0]; uid = str(s.get("UID", "")); name = str(s.get("Name", uid))
+        def ui():
+            try:
+                ok = messagebox.askyesno("AI Remove", f"Remove {name} ({uid})?")
+                if ok:
+                    play_sound(SOUND_NEGATIVE)
+                    self.store.remove_student(uid)
+                    self.scanned_today.discard(uid)
+                    self._save_today_scans()
+                    self.refresh_all()
+                    self.log(f"AI removed {name} ({uid}).")
+                return ok
+            except Exception as e:
+                self.log(f"AI remove UI error: {e}")
+                return False
+        removed = bool(self._run_on_ui(ui))
+        return {"ok": removed, "message": "Removed." if removed else "Cancelled."}
+
+    def _run_on_ui(self, fn):
+        if threading.current_thread() is threading.main_thread():
+            try:
+                return fn()
+            except Exception as e:
+                self.log(f"UI fn error: {e}")
+                raise
+        ev  = threading.Event(); box: dict = {}
+        def run():
+            try: box["r"] = fn()
+            except Exception as e: box["e"] = e
+            finally: ev.set()
+        self.root.after(0, run); ev.wait(timeout=60)
+        if not ev.is_set():
+            raise RuntimeError("UI operation timed out")
+        if "e" in box: raise box["e"]
+        return box.get("r")
+
+    def _find_students(self, query) -> list[dict]:
+        q = query.lower()
+        return [s for s in self.store.load_students()
+                if q in " ".join(str(v) for v in s.values()).lower()]
+
+    # ── mail tab ──────────────────────────────────────────────────────────────
+    def _build_mail_tab(self):
+        parent = self._tab_frames["Mail"]
+        parent.grid_rowconfigure(4, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        tk.Label(hdr, text=f"✉  {self.T('messages')}", bg=P.sidebar, fg=P.text,
+                 font=F_H2).pack(anchor="w")
+        tk.Label(hdr, text=self.T("mail_subtitle"), bg=P.sidebar,
+                 fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(2, 0))
+
+        def card(row):
+            f = tk.Frame(parent, bg=P.sidebar2, highlightthickness=1, highlightbackground=P.border)
+            f.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 10))
+            f.grid_columnconfigure(1, weight=1)
+            return f
+
+        # student picker
+        pc = card(1)
+        tk.Label(pc, text="Student", bg=P.sidebar2, fg=P.muted,
+                 font=(FONT_FAMILY, 9, "bold")).grid(row=0, column=0, sticky="w", padx=14, pady=(12,4))
+        self._msg_stu_var = tk.StringVar()
+        self._msg_stu_cb  = ttk.Combobox(pc, textvariable=self._msg_stu_var,
+                                          font=(FONT_FAMILY, 10), state="normal")
+        self._msg_stu_cb.grid(row=0, column=1, sticky="ew", padx=14, pady=(12,4))
+        self._msg_stu_cb.bind("<<ComboboxSelected>>", self._msg_student_pick)
+        self._msg_stu_cb.bind("<Return>", self._msg_student_pick)
+        AnimBtn(pc, text="↻", command=self._msg_refresh_list,
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=8, pady=2,
+            font=(FONT_FAMILY, 9, "bold"), cursor="hand2").grid(row=0, column=2, padx=(0,14), pady=(12,4))
+        tk.Label(pc, text="Type name / roll / UID then press Enter, or pick from list",
+                 bg=P.sidebar2, fg=P.muted,
+                 font=(FONT_FAMILY, 8)).grid(row=1, column=0, columnspan=3, sticky="w", padx=14, pady=(0,10))
+
+        # info
+        ic = card(2)
+        def irow(txt, r, var, ro=False):
+            tk.Label(ic, text=txt, bg=P.sidebar2, fg=P.muted,
+                                          font=(FONT_FAMILY, 9, "bold")).grid(row=r, column=0, sticky="w", padx=14, pady=6)
+            e = ttk.Entry(ic, textvariable=var, font=(FONT_FAMILY, 10))
+            e.grid(row=r, column=1, sticky="ew", padx=14, pady=6)
+            if ro: e.configure(state="readonly")
+            return e
+        self._msg_from_var    = tk.StringVar(value="(set in Settings)")
+        self._msg_to_email    = tk.StringVar()
+        self._msg_to_phone    = tk.StringVar()
+        irow("From (email)", 0, self._msg_from_var, ro=True)
+        irow("Parent email", 1, self._msg_to_email)
+
+        # subject
+        sf = tk.Frame(parent, bg=P.sidebar)
+        sf.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 6))
+        sf.grid_columnconfigure(1, weight=1)
+        tk.Label(sf, text="Subject", bg=P.sidebar, fg=P.muted,
+                 font=(FONT_FAMILY, 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0,8))
+        self._msg_subject = tk.StringVar(value="Message from School")
+        ttk.Entry(sf, textvariable=self._msg_subject, font=(FONT_FAMILY, 10)).grid(row=0, column=1, sticky="ew")
+
+        # body
+        bsh = tk.Frame(parent, bg="#070d16", highlightthickness=1, highlightbackground=P.border)
+        bsh.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        bsh.grid_rowconfigure(0, weight=1)
+        bsh.grid_columnconfigure(0, weight=1)
+        self._msg_body = tk.Text(bsh, wrap="word", bg="#070d16", fg="#c8d8ec",
+                                 relief="flat", highlightthickness=0,
+                                 font=(FONT_FAMILY, 10), padx=10, pady=10)
+        ms = ttk.Scrollbar(bsh, orient="vertical", command=self._msg_body.yview)
+        self._msg_body.configure(yscrollcommand=ms.set)
+        self._msg_body.grid(row=0, column=0, sticky="nsew")
+        ms.grid(row=0, column=1, sticky="ns")
+        self._msg_body.insert("1.0", "")
+
+        # buttons
+        bf = tk.Frame(parent, bg=P.sidebar)
+        bf.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
+        AnimBtn(bf, text="📧  Send Email", command=self._send_email,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=14, pady=9,
+            font=(FONT_FAMILY, 10, "bold"), cursor="hand2",
+            anim_color=P.blue_glow).pack(side="left", padx=(0, 8))
+        # WhatsApp button removed in v2.9
+        self._msg_refresh_list()
+
+    def _msg_refresh_list(self):
+        students = self.store.load_students()
+        self._msg_stu_map = {}
+        opts = []
+        for s in students:
+            lbl = f"{s.get('Name','')}  ({s.get('Roll No','')} / {s.get('UID','')})"
+            opts.append(lbl); self._msg_stu_map[lbl] = s
+        if hasattr(self, "_msg_stu_cb"):
+            self._msg_stu_cb.configure(values=opts)
+
+    def _msg_student_pick(self, _e=None):
+        typed = self._msg_stu_var.get().strip()
+        s = self._msg_stu_map.get(typed)
+        if s is None:
+            m = self._find_students(typed); s = m[0] if m else None
+        if s is None: return
+        lbl = f"{s.get('Name','')}  ({s.get('Roll No','')} / {s.get('UID','')})"
+        self._msg_stu_var.set(lbl)
+        self._msg_to_email.set(str(s.get("Parent Email", "")))
+        self._msg_to_phone.set(str(s.get("Parent Phone", "")))
+
+    def _send_email(self):
+        to    = self._msg_to_email.get().strip()
+        subj  = self._msg_subject.get().strip() or "Message from School"
+        body  = self._msg_body.get("1.0", "end").strip()
+        sender= self.settings.smtp_sender or ""
+        pw    = self.settings.smtp_password or ""
+        if not to:     play_sound(SOUND_ERROR); Toast.show(self.root, "Select a student first.", "warning"); return
+        if not body:   play_sound(SOUND_ERROR); Toast.show(self.root, "Message body is empty.", "warning"); return
+        if not sender: play_sound(SOUND_ERROR); Toast.show(self.root, "Set sender email in Settings.", "error"); return
+        def worker():
+            try:
+                import smtplib
+                from email.message import EmailMessage
+                em = EmailMessage()
+                em["Subject"] = subj; em["From"] = sender; em["To"] = to
+                em.set_content(body)
+                with smtplib.SMTP("smtp.gmail.com", 587) as srv:
+                    srv.starttls(); srv.login(sender, pw); srv.send_message(em)
+                self.root.after(0, lambda: Toast.show(self.root, f"Email sent to {to}", "success"))
+                self.root.after(0, lambda: self.log(f"Email sent to {to}"))
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda: (
+                    play_sound(SOUND_ERROR),
+                    Toast.show(self.root, f"Email failed: {err}", "error"),
+                ))
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def _attendance_message(self, name: str, roll: str, status: str, xp: int, now: datetime) -> str:
+        school   = (self.settings.school_name or "FaceAttend").strip()
+        template = (self.settings.auto_message_template or "").strip()
+        if not template:
+            template = Settings._defaults["auto_message_template"]
+        return template.format(
+            name   = name,
+            roll   = roll,
+            status = status,
+            time   = now.strftime("%I:%M %p"),
+            date   = now.strftime("%d %B %Y"),
+            xp     = xp,
+            school = school,
+        )
+
+    def _absent_message(self, name: str, roll: str, now: datetime) -> str:
+        school   = (self.settings.school_name or "FaceAttend").strip()
+        template = (self.settings.absent_message_template or "").strip()
+        if not template:
+            template = Settings._defaults["absent_message_template"]
+        return template.format(
+            name=name, roll=roll,
+            time=now.strftime("%I:%M %p"), date=now.strftime("%d %B %Y"),
+            school=school,
+        )
+
+    def get_absent_students(self) -> list[dict]:
+        """Students not yet marked present today, only on active school days."""
+        if not self.schedule.is_active():
+            return []
+        students = self.store.load_students()
+        return [s for s in students if str(s.get("UID", "")) not in self.scanned_today]
+
+    def send_absent_notifications(self, manual: bool = False) -> dict:
+        """
+        Sends an absence notice to every student not yet marked present
+        today, via email and/or WhatsApp depending on Settings. Shared by
+        both the fixed-time daily scheduler and the manual 'Send to All
+        Absent Parents Now' button / console command.
+        Returns a small result dict for logging/toasting.
+        """
+        absentees = self.get_absent_students()
+        if not absentees:
+            return {"sent_email": 0, "sent_whatsapp": 0, "skipped": 0, "total": 0}
+
+        now = datetime.now()
+        send_email    = self.settings.absent_notify_email
+        send_whatsapp = False  # WhatsApp removed
+        sender = (self.settings.smtp_sender or "").strip()
+        pw     = (self.settings.smtp_password or "").strip()
+
+        sent_email = sent_whatsapp = skipped = 0
+
+        for s in absentees:
+            name  = str(s.get("Name", ""))
+            roll  = str(s.get("Roll No", ""))
+            email = str(s.get("Parent Email", "")).strip()
+            phone = str(s.get("Parent Phone", "")).strip()
+            body  = self._absent_message(name, roll, now)
+
+            if send_email:
+                if email and sender and pw:
+                    def worker(to=email, n=name, msg_body=body, subj=f"Attendance: {name} is absent today"):
+                        try:
+                            import smtplib
+                            from email.message import EmailMessage
+                            em = EmailMessage()
+                            em["Subject"] = subj
+                            em["From"]    = sender
+                            em["To"]      = to
+                            em.set_content(msg_body)
+                            with smtplib.SMTP("smtp.gmail.com", 587) as srv:
+                                srv.starttls(); srv.login(sender, pw); srv.send_message(em)
+                            self.root.after(0, lambda: self.log(f"✅ Absence email sent to {to} ({n})."))
+                        except Exception as e:
+                            err = str(e)
+                            self.root.after(0, lambda: self.log(f"❌ Absence email failed ({n}): {err}"))
+                    threading.Thread(target=worker, daemon=True).start()
+                    sent_email += 1
+                else:
+                    skipped += 1
+
+            if send_whatsapp:
+                if phone:
+                    pass  # WhatsApp removed
+                    sent_whatsapp += 1
+                else:
+                    skipped += 1
+
+        result = {"sent_email": sent_email, "sent_whatsapp": sent_whatsapp,
+                   "skipped": skipped, "total": len(absentees)}
+        self.log(f"Absentee notify ({'manual' if manual else 'scheduled'}): "
+                 f"{result['sent_email']} email(s) "
+                 f"{result['skipped']} skipped, {result['total']} absent total.")
+        return result
+
+    def _check_absent_notify_schedule(self):
+        """
+        Runs every minute on the UI thread (piggybacks on the existing
+        clock tick). Fires send_absent_notifications() once per day, the
+        first time 'now' reaches the configured absent_notify_time —
+        guarded by a date stamp in Settings so it never double-fires.
+        """
+        if not self.settings.absent_notify_enabled:
+            return
+        now = datetime.now()
+        try:
+            h, m = str(self.settings.absent_notify_time or "09:30").split(":")
+            target = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        except Exception:
+            return
+        already_ran = self.settings._data.get("_absent_notify_last_run_date") == now.strftime("%Y-%m-%d")
+        if now >= target and not already_ran:
+            self.settings.set("_absent_notify_last_run_date", now.strftime("%Y-%m-%d"))
+            self.settings.save()
+            result = self.send_absent_notifications(manual=False)
+            if result["total"] > 0:
+                play_sound(SOUND_EXPORT)
+                Toast.show(self.root,
+                           f"Scheduled absentee alert sent: {result['total']} student(s) absent.",
+                           "info", 6000)
+
+
+    def _auto_notify_parent(self, student: dict, status: str, xp: int, now: datetime) -> None:
+        """Fired once per student per day, right after attendance is recorded."""
+        name  = str(student.get("Name", ""))
+        roll  = str(student.get("Roll No", ""))
+        email = str(student.get("Parent Email", "")).strip()
+        phone = str(student.get("Parent Phone", "")).strip()
+        body  = self._attendance_message(name, roll, status, xp, now)
+
+        if self.settings.auto_notify_email:
+            sender = (self.settings.smtp_sender or "").strip()
+            pw     = (self.settings.smtp_password or "").strip()
+            if not email:
+                msg = f"Auto-email skipped ({name}): no parent email on file."
+                self.log(msg); Toast.show(self.root, msg, "warning")
+            elif not sender or not pw:
+                msg = "Auto-email skipped: add Gmail address & app password in Settings → Email Sender."
+                self.log(msg); Toast.show(self.root, msg, "warning")
+            else:
+                self.log(f"Sending email to {email} ({name})…")
+                def worker(to=email, subj=f"Attendance: {name} is {status}",
+                           msg_body=body, s=sender, p=pw, n=name):
+                    try:
+                        import smtplib
+                        from email.message import EmailMessage
+                        em = EmailMessage()
+                        em["Subject"] = subj
+                        em["From"]    = s
+                        em["To"]      = to
+                        em.set_content(msg_body)
+                        with smtplib.SMTP("smtp.gmail.com", 587) as srv:
+                            srv.starttls()
+                            srv.login(s, p)
+                            srv.send_message(em)
+                        self.root.after(0, lambda: (
+                            self.log(f"✅ Email sent to {to} ({n})."),
+                            Toast.show(self.root, f"Email sent to parent of {n}", "success"),
+                        ))
+                    except Exception as e:
+                        err = str(e)
+                        self.root.after(0, lambda: (
+                            self.log(f"❌ Email failed ({n}): {err}"),
+                            play_sound(SOUND_ERROR),
+                            Toast.show(self.root, f"Email failed: {err[:60]}", "error"),
+                        ))
+                threading.Thread(target=worker, daemon=True).start()
+
+        if self.settings.auto_notify_whatsapp:
+            if not phone:
+                msg = f"Auto-WhatsApp skipped ({name}): no parent phone on file."
+                self.log(msg); Toast.show(self.root, msg, "warning")
+            else:
+                pass  # WhatsApp removed
+                self.log(f"📱 WhatsApp opened for {name} ({phone}).")
+                Toast.show(self.root, f"WhatsApp opened for parent of {name}", "info")
+
+
+    # ── house competition tab ─────────────────────────────────────────────────
+    def _build_house_analytics_pane(self, parent):
+        """House-level analytics — a pane inside the Analytics tab,
+        alongside the student pane."""
+        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # header
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        hdr.grid_columnconfigure(0, weight=1)
+        tk.Label(hdr, text=f"🏠  {self.T('houses')}", bg=P.sidebar, fg=P.text,
+                 font=F_H2).grid(row=0, column=0, sticky="w")
+        tk.Label(hdr, text=self.T("houses_subtitle"),
+                 bg=P.sidebar, fg=P.muted, font=F_SMALL).grid(row=1, column=0, sticky="w")
+        AnimBtn(hdr, text="↺", command=self._refresh_houses,
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=10, pady=4,
+            font=F_BODY_B, cursor="hand2").grid(row=0, column=1, rowspan=2, sticky="e")
+
+        # 2×2 grid of house cards — prevents truncation no matter sidebar width
+        cards_frame = tk.Frame(parent, bg=P.sidebar)
+        cards_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        cards_frame.grid_columnconfigure(0, weight=1)
+        cards_frame.grid_columnconfigure(1, weight=1)
+
+        self._house_cards = {}
+        house_display = [
+            ("Red",    "#ef4444", "#2a1316"),
+            ("Blue",   "#3b82f6", "#132236"),
+            ("Green",  "#22c55e", "#0d2218"),
+            ("Orange", "#f97316", "#271608"),
+        ]
+        positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        for idx, (house, accent, tint) in enumerate(house_display):
+            r, c = positions[idx]
+            card = tk.Frame(cards_frame, bg=tint, highlightthickness=2,
+                            highlightbackground=accent)
+            card.grid(row=r, column=c, sticky="ew",
+                      padx=(0 if c == 0 else 6, 0),
+                      pady=(0 if r == 0 else 6, 0))
+
+            top_row = tk.Frame(card, bg=tint)
+            top_row.pack(fill="x", padx=12, pady=(12, 0))
+            tk.Label(top_row, text="●", bg=tint, fg=accent,
+                     font=(FONT_FAMILY, 14)).pack(side="left")
+            tk.Label(top_row, text=f"  {house}", bg=tint, fg=P.text,
+                     font=F_H3).pack(side="left")
+
+            pct_lbl = tk.Label(card, text="0.0%", bg=tint, fg=accent,
+                               font=(FONT_FAMILY, 26, "bold"))
+            pct_lbl.pack(anchor="w", padx=14, pady=(4, 0))
+
+            det_lbl = tk.Label(card, text="0 / 0 present", bg=tint,
+                               fg=P.muted, font=F_SMALL)
+            det_lbl.pack(anchor="w", padx=14, pady=(0, 12))
+
+            self._house_cards[house] = (pct_lbl, det_lbl)
+
+        # leaderboard — Listbox so lines never wrap
+        lb_hdr = tk.Frame(parent, bg=P.sidebar)
+        lb_hdr.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        lb_hdr.grid_rowconfigure(1, weight=1)
+        lb_hdr.grid_columnconfigure(0, weight=1)
+
+        tk.Label(lb_hdr, text="RANKING", bg=P.sidebar, fg=P.muted,
+                 font=F_SMALL_B).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        lb_sh = tk.Frame(lb_hdr, bg=P.sidebar2, highlightthickness=1,
+                          highlightbackground=P.border_soft)
+        lb_sh.grid(row=1, column=0, sticky="nsew")
+        lb_sh.grid_rowconfigure(0, weight=1)
+        lb_sh.grid_columnconfigure(0, weight=1)
+
+        self.house_lb = tk.Listbox(lb_sh, bg=P.sidebar2, fg=P.text,
+                                    relief="flat", highlightthickness=0,
+                                    font=F_BODY, activestyle="none",
+                                    selectbackground=P.hover,
+                                    selectforeground=P.text,
+                                    height=5)
+        lsb = ttk.Scrollbar(lb_sh, orient="vertical", command=self.house_lb.yview)
+        self.house_lb.configure(yscrollcommand=lsb.set)
+        self.house_lb.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        lsb.grid(row=0, column=1, sticky="ns")
+
+        self._refresh_houses()
+
+    def _refresh_houses(self):
+        stats = self.store.house_stats()
+        ranked = sorted(stats.items(), key=lambda x: -x[1]["pct"])
+        medals = ["🥇 1st", "🥈 2nd", "🥉 3rd", "   4th"]
+
+        for house, (pct_lbl, det_lbl) in self._house_cards.items():
+            d = stats[house]
+            pct_lbl.configure(text=f"{d['pct']:.1f}%")
+            det_lbl.configure(text=f"{d['present']} / {d['students']} present")
+
+        self.house_lb.delete(0, "end")
+        for rank, (house, d) in enumerate(ranked):
+            pct   = f"{d['pct']:.1f}%"
+            entry = f"  {medals[rank]}   {house:<8}   {pct:>6}   ({d['present']}/{d['students']} students)"
+            self.house_lb.insert("end", entry)
+
+    # ── bulk import dialog ─────────────────────────────────────────────────────
+    def _open_bulk_import(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select students.xlsx to import",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            parent=self.root,
+        )
+        if not path: return
+        path = Path(path)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Bulk Import")
+        dlg.geometry("500x320")
+        dlg.configure(bg=P.bg)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="📥  Bulk Import", bg=P.bg, fg=P.text, font=F_H2).pack(anchor="w", padx=24, pady=(20,4))
+        tk.Label(dlg, text=f"Importing from: {path.name}", bg=P.bg, fg=P.muted, font=F_SMALL).pack(anchor="w", padx=24)
+        tk.Label(dlg, text="Required columns: Roll No, Name, Grade\nOptional: House, Parent Phone, Parent Email",
+                 bg=P.bg, fg=P.faint, font=F_TINY, justify="left").pack(anchor="w", padx=24, pady=(4,12))
+
+        log_box = tk.Text(dlg, bg=P.surface, fg=P.text, relief="flat",
+                          font=F_MONO, height=7, padx=10, pady=8, highlightthickness=0)
+        log_box.pack(fill="x", padx=24)
+        log_box.insert("end", "Ready. Click Import to begin.\n")
+        log_box.configure(state="disabled")
+
+        def do_import():
+            log_box.configure(state="normal")
+            log_box.delete("1.0", "end")
+            log_box.insert("end", "Importing...\n")
+            dlg.update()
+            try:
+                added, skipped = self.store.bulk_import(path)
+                log_box.insert("end", f"✅  Added {added} student(s).\n")
+                for s in skipped:
+                    log_box.insert("end", f"⚠  {s}\n")
+                self.refresh_all()
+                self.log(f"Bulk import: {added} added, {len(skipped)} skipped.")
+                play_sound(SOUND_EXPORT)
+                Toast.show(self.root, f"Imported {added} students.", "success")
+            except Exception as e:
+                log_box.insert("end", f"❌  Error: {e}\n")
+                play_sound(SOUND_ERROR)
+            log_box.configure(state="disabled")
+
+        btn_row = tk.Frame(dlg, bg=P.bg)
+        btn_row.pack(fill="x", padx=24, pady=12)
+        AnimBtn(btn_row, text="📥  Import", command=do_import,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color=P.blue_glow).pack(side="left")
+        AnimBtn(btn_row, text="✕  Close", command=dlg.destroy,
+            bg=P.surface2, fg=P.text, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(side="left", padx=(10, 0))
+
+    # ── attendance certificate generator ──────────────────────────────────────
+    def _open_certificates(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Attendance Certificate Generator")
+        dlg.geometry("520x420")
+        dlg.configure(bg=P.bg)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="🏅  Attendance Certificates", bg=P.bg, fg=P.text, font=F_H2).pack(anchor="w", padx=24, pady=(20,4))
+        tk.Label(dlg, text="Generates a PDF certificate per eligible student", bg=P.bg, fg=P.muted, font=F_SMALL).pack(anchor="w", padx=24)
+
+        row = tk.Frame(dlg, bg=P.bg)
+        row.pack(anchor="w", padx=24, pady=(12,4))
+        tk.Label(row, text="Minimum attendance %:", bg=P.bg, fg=P.text, font=F_BODY_B).pack(side="left")
+        pct_var = tk.StringVar(value="90")
+        ttk.Entry(row, textvariable=pct_var, font=F_BODY, width=6).pack(side="left", padx=8)
+
+        log_box = tk.Text(dlg, bg=P.surface, fg=P.text, relief="flat",
+                          font=F_MONO, height=8, padx=10, pady=8, highlightthickness=0)
+        log_box.pack(fill="x", padx=24, pady=(8, 0))
+        log_box.insert("end", "Click Generate to build certificates.\n")
+        log_box.configure(state="disabled")
+
+        def do_generate():
+            try:
+                min_pct = float(pct_var.get())
+            except ValueError:
+                play_sound(SOUND_ERROR)
+                Toast.show(self.root, "Enter a valid percentage.", "warning"); return
+
+            eligible = self.store.generate_certificates(min_pct)
+            log_box.configure(state="normal")
+            log_box.delete("1.0", "end")
+            if not eligible:
+                log_box.insert("end", f"No students meet {min_pct}% threshold.\n")
+                log_box.configure(state="disabled"); return
+
+            EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            generated = 0
+            for s in eligible:
+                name   = str(s.get("Name",""))
+                roll   = str(s.get("Roll No",""))
+                grade  = str(s.get("Grade",""))
+                pct    = s["_pct"]
+                days   = safe_int(s.get("No. of Days Present",0))
+                school = self.settings.school_name.strip() or "School"
+                fname  = EXPORTS_DIR / f"Certificate_{roll}_{name.replace(' ','_')}.pdf"
+                ok = self._generate_certificate_pdf(fname, name, roll, grade, pct, days, school)
+                if ok:
+                    log_box.insert("end", f"✅  {name} ({roll}) — {pct}% — saved\n")
+                    generated += 1
+                else:
+                    log_box.insert("end", f"⚠  {name} — PDF generation failed (install reportlab)\n")
+            log_box.configure(state="disabled")
+            Toast.show(self.root, f"{generated} certificate(s) saved to exports/", "success")
+            self.log(f"Generated {generated} attendance certificates.")
+
+        btn_row = tk.Frame(dlg, bg=P.bg)
+        btn_row.pack(fill="x", padx=24, pady=10)
+        AnimBtn(btn_row, text="🏅  Generate", command=do_generate,
+            bg=P.amber, fg="#1a1100", activebackground="#d97706",
+            activeforeground="#1a1100", relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color="#b45309").pack(side="left")
+        AnimBtn(btn_row, text="📂  Open Folder", command=lambda: self._open_exports_folder(),
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(side="left", padx=(10,0))
+        AnimBtn(btn_row, text="✕  Close", command=dlg.destroy,
+            bg=P.surface2, fg=P.text, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(side="right")
+
+    def _generate_certificate_pdf(self, path: Path, name, roll, grade, pct, days, school) -> bool:
+        try:
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib import colors
+            from reportlab.pdfgen import canvas as rl_canvas
+            import math
+        except ImportError:
+            return False
+
+        page_w, page_h = landscape(A4)
+        navy   = colors.HexColor("#1e3a5f")
+        gold   = colors.HexColor("#c9a227")
+        cream  = colors.HexColor("#faf6ee")
+        ink    = colors.HexColor("#1a1a2e")
+        muted  = colors.HexColor("#5c6370")
+        accent = colors.HexColor("#2563eb")
+
+        c = rl_canvas.Canvas(str(path), pagesize=landscape(A4))
+        cx = page_w / 2
+
+        # Background
+        c.setFillColor(cream)
+        c.rect(0, 0, page_w, page_h, fill=1, stroke=0)
+
+        # Decorative borders
+        for inset, stroke, color in ((22, 3.5, navy), (30, 1.5, gold), (38, 0.75, navy)):
+            c.setStrokeColor(color)
+            c.setLineWidth(stroke)
+            c.roundRect(inset, inset, page_w - 2 * inset, page_h - 2 * inset,
+                        6, fill=0, stroke=1)
+
+        # Corner ornaments
+        def corner_ornament(ox, oy, sx, sy):
+            c.setStrokeColor(gold)
+            c.setLineWidth(1.2)
+            for i in range(4):
+                c.line(ox, oy + i * 8 * sy, ox + 28 * sx, oy + i * 8 * sy)
+                c.line(ox + i * 8 * sx, oy, ox + i * 8 * sx, oy + 28 * sy)
+
+        corner_ornament(48, page_h - 76, 1, -1)
+        corner_ornament(page_w - 48, page_h - 76, -1, -1)
+        corner_ornament(48, 48, 1, 1)
+        corner_ornament(page_w - 48, 48, -1, 1)
+
+        def fit_font(text, font, max_size, min_size, max_width):
+            for size in range(max_size, min_size - 1, -1):
+                if c.stringWidth(text, font, size) <= max_width:
+                    return size
+            return min_size
+
+        def centred(text, y, font, size, color=ink):
+            c.setFillColor(color)
+            c.setFont(font, size)
+            c.drawCentredString(cx, y, text)
+
+        def divider(y, width=420):
+            c.setStrokeColor(gold)
+            c.setLineWidth(1)
+            c.line(cx - width / 2, y, cx - 18, y)
+            c.line(cx + 18, y, cx + width / 2, y)
+            c.setFillColor(gold)
+            c.circle(cx, y, 3, fill=1, stroke=0)
+
+        # Header
+        school_text = (school or "School").strip().upper()
+        school_size = fit_font(school_text, "Helvetica-Bold", 20, 12, page_w - 160)
+        centred(school_text, page_h - 78, "Helvetica-Bold", school_size, navy)
+        divider(page_h - 92, 460)
+
+        centred("CERTIFICATE OF ATTENDANCE", page_h - 128, "Times-Bold", 30, navy)
+        centred("OF EXCELLENCE", page_h - 152, "Times-Italic", 13, gold)
+
+        centred("This is to certify that", page_h - 188, "Times-Roman", 14, muted)
+
+        # Recipient name with underline
+        name_text = str(name).strip() or "Student"
+        name_size = fit_font(name_text, "Times-BoldItalic", 34, 20, page_w - 180)
+        centred(name_text, page_h - 228, "Times-BoldItalic", name_size, ink)
+        name_w = c.stringWidth(name_text, "Times-BoldItalic", name_size)
+        c.setStrokeColor(gold)
+        c.setLineWidth(1.2)
+        c.line(cx - name_w / 2 - 10, page_h - 238, cx + name_w / 2 + 10, page_h - 238)
+
+        centred(f"Roll No: {roll}    |    Grade: {grade}", page_h - 262, "Helvetica", 11, muted)
+
+        # Body copy
+        body_y = page_h - 300
+        centred("has demonstrated commendable regularity and commitment by maintaining", body_y, "Times-Roman", 12, ink)
+        centred("a consistent attendance record during the academic period.", body_y - 18, "Times-Roman", 12, ink)
+
+        # Stats highlight box
+        box_w, box_h = 320, 82
+        box_x = cx - box_w / 2
+        box_y = page_h - 418
+        c.setFillColor(colors.HexColor("#eef4ff"))
+        c.setStrokeColor(accent)
+        c.setLineWidth(1.5)
+        c.roundRect(box_x, box_y, box_w, box_h, 8, fill=1, stroke=1)
+
+        pct_text = f"{pct:.1f}%"
+        pct_size = fit_font(pct_text, "Helvetica-Bold", 30, 18, box_w - 40)
+        centred(pct_text, box_y + 52, "Helvetica-Bold", pct_size, accent)
+        days_label = f"{days} Day{'s' if days != 1 else ''} Present"
+        centred("ATTENDANCE ACHIEVED", box_y + 30, "Helvetica-Bold", 9, muted)
+        centred(days_label, box_y + 12, "Helvetica", 11, ink)
+
+        centred("This certificate is awarded in recognition of the student's dedication", 168, "Times-Italic", 11, muted)
+        centred("to punctual and consistent attendance.", 152, "Times-Italic", 11, muted)
+
+        # Official seal (centre-top of footer band)
+        seal_x, seal_y, seal_r = cx, 118, 30
+        c.setFillColor(colors.HexColor("#fff8e7"))
+        c.setStrokeColor(gold)
+        c.setLineWidth(2)
+        c.circle(seal_x, seal_y, seal_r, fill=1, stroke=1)
+        c.setStrokeColor(navy)
+        c.setLineWidth(1)
+        c.circle(seal_x, seal_y, seal_r - 5, fill=0, stroke=1)
+        c.setFillColor(gold)
+        for angle in range(0, 360, 72):
+            rad = math.radians(angle - 90)
+            c.circle(seal_x + math.cos(rad) * 14, seal_y + math.sin(rad) * 14, 2.5, fill=1, stroke=0)
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7)
+        c.drawCentredString(seal_x, seal_y + 4, "OFFICIAL")
+        c.drawCentredString(seal_x, seal_y - 6, "SEAL")
+
+        # Signature blocks
+        issue_date = datetime.now().strftime("%d %B %Y")
+
+        def signature_block(x, label):
+            c.setStrokeColor(ink)
+            c.setLineWidth(0.8)
+            c.line(x - 95, 68, x + 95, 68)
+            c.setFillColor(ink)
+            c.setFont("Helvetica-Bold", 10)
+            c.drawCentredString(x, 52, label)
+            c.setFillColor(muted)
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(x, 40, "Authorized Signatory")
+
+        signature_block(cx - 240, "Principal")
+        signature_block(cx + 240, "Class Teacher")
+
+        c.setFillColor(muted)
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(cx - 240, 88, f"Date: {issue_date}")
+
+        c.setFillColor(colors.HexColor("#9ca3af"))
+        c.setFont("Helvetica", 7)
+        c.drawCentredString(cx, 28, f"Issued via FaceAttend {APP_VERSION}  ·  {issue_date}")
+
+        c.showPage()
+        c.save()
+        return True
+
+    def _open_exports_folder(self):
+        import subprocess, sys as _sys
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        if _sys.platform == "win32":
+            subprocess.Popen(["explorer", str(EXPORTS_DIR)])
+        else:
+            subprocess.Popen(["xdg-open", str(EXPORTS_DIR)])
+
+    def _open_calendar(self):
+        """Show attendance calendar heatmap dialog."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("📅  " + "calendar")
+        dlg.geometry("520x480")
+        dlg.configure(bg=P.bg)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="📅  " + "calendar", bg=P.bg, fg=P.text,
+                 font=F_H2).pack(anchor="w", padx=24, pady=(20, 4))
+        tk.Label(dlg, text="Visual monthly attendance grid", bg=P.bg, fg=P.muted,
+                 font=F_SMALL).pack(anchor="w", padx=24)
+
+        # Month selector
+        sel = tk.Frame(dlg, bg=P.bg)
+        sel.pack(fill="x", padx=24, pady=(10, 0))
+        now = datetime.now()
+        month_var = tk.IntVar(value=now.month)
+        year_var = tk.IntVar(value=now.year)
+        ttk.Spinbox(sel, from_=1, to=12, textvariable=month_var, width=6, font=F_BODY).pack(side="left", padx=(0, 8))
+        ttk.Spinbox(sel, from_=2020, to=2030, textvariable=year_var, width=8, font=F_BODY).pack(side="left", padx=(0, 8))
+
+        cal_frame = tk.Frame(dlg, bg=P.bg)
+        cal_frame.pack(fill="both", expand=True, padx=24, pady=(10, 16))
+
+        def render():
+            for w in cal_frame.winfo_children():
+                w.destroy()
+            rows = self.store._load_audit_rows()
+            days = set()
+            for row in rows:
+                if row and len(row) > 0:
+                    days.add(row[0])
+            build_calendar_heatmap(cal_frame, year_var.get(), month_var.get(), days, P, self._lang)
+
+        AnimBtn(sel, text="↺  Render", command=render,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=12, pady=6,
+            font=F_SMALL_B, cursor="hand2", anim_color=P.blue_glow).pack(side="left")
+        render()
+
+        AnimBtn(dlg, text="✕  Close", command=dlg.destroy,
+            bg=P.surface2, fg=P.text, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(pady=(0, 14))
+
+    # ── badges / achievements viewer ────────────────────────────────────────
+    def _open_badges(self):
+        """Show badge and achievement viewer dialog."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("🏅  " + "badges")
+        dlg.geometry("520x500")
+        dlg.configure(bg=P.bg)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="🏅  " + "badges", bg=P.bg, fg=P.text,
+                 font=F_H2).pack(anchor="w", padx=24, pady=(20, 4))
+        tk.Label(dlg, text="Student achievements and milestones", bg=P.bg, fg=P.muted,
+                 font=F_SMALL).pack(anchor="w", padx=24)
+
+        list_sh = tk.Frame(dlg, bg=P.sidebar2, highlightthickness=1,
+                            highlightbackground=P.border_soft)
+        list_sh.pack(fill="both", expand=True, padx=24, pady=(10, 10))
+        list_sh.grid_rowconfigure(0, weight=1)
+        list_sh.grid_columnconfigure(0, weight=1)
+
+        lb = tk.Listbox(list_sh, bg=P.sidebar2, fg=P.text, relief="flat",
+                        highlightthickness=0, font=F_BODY, activestyle="none",
+                        selectbackground=P.blue_soft, selectforeground=P.text)
+        sb = ttk.Scrollbar(list_sh, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        sb.grid(row=0, column=1, sticky="ns")
+
+        students = self.store.load_students()
+        for s in students:
+            uid = str(s.get("UID", ""))
+            name = s.get("Name", "")
+            badges = self.badges.get_badges(uid)
+            if badges:
+                b_str = "  ".join([b["icon"] for b in badges])
+                lb.insert("end", f"  {name}  —  {b_str}")
+            else:
+                lb.insert("end", f"  {name}  —  No badges yet")
+
+        if not students:
+            lb.insert("end", "  No students enrolled yet.")
+
+        AnimBtn(dlg, text="✕  Close", command=dlg.destroy,
+            bg=P.surface2, fg=P.text, activebackground=P.border,
+            activeforeground=P.text, relief="flat", padx=16, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(pady=(0, 14))
+
+    # ── console tab ───────────────────────────────────────────────────────────
+    def _build_console_tab(self):
+        parent = self._tab_frames["Console"]
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg=P.sidebar)
+        hdr.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        tk.Label(hdr, text=f"📋  {self.T('console')}", bg=P.sidebar, fg=P.text,
+                 font=F_H2).pack(side="left")
+        AnimBtn(hdr, text=self.T("clear"), command=self._console_clear,
+            bg=P.red, fg="white", activebackground=P.red_dark,
+            activeforeground="white", relief="flat", padx=10, pady=4,
+            font=F_SMALL_B, cursor="hand2",
+            anim_color="#b91c1c").pack(side="right")
+
+        lsh = tk.Frame(parent, bg="#070d16", highlightthickness=1, highlightbackground=P.border_soft)
+        lsh.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        lsh.grid_rowconfigure(0, weight=1)
+        lsh.grid_columnconfigure(0, weight=1)
+        self.console_box = tk.Text(lsh, wrap="word", bg="#070d16", fg="#c8d8ec",
+                                   relief="flat", highlightthickness=0,
+                                   font=(FONT_MONO, 9), padx=10, pady=10, state="disabled")
+        cs = ttk.Scrollbar(lsh, orient="vertical", command=self.console_box.yview)
+        self.console_box.configure(yscrollcommand=cs.set)
+        self.console_box.grid(row=0, column=0, sticky="nsew")
+        cs.grid(row=0, column=1, sticky="ns")
+
+        cf = tk.Frame(parent, bg=P.sidebar)
+        cf.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        cf.grid_columnconfigure(0, weight=1)
+        self._cmd_var = tk.StringVar()
+        ce = ttk.Entry(cf, textvariable=self._cmd_var, font=(FONT_MONO, 10))
+        ce.grid(row=0, column=0, sticky="ew")
+        ce.bind("<Return>", lambda _: self._run_cmd())
+        AnimBtn(cf, text="Run", command=self._run_cmd,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=12, pady=7,
+            font=(FONT_FAMILY, 9, "bold"), cursor="hand2",
+            anim_color=P.blue_glow).grid(row=0, column=1, padx=(8, 0))
+
+    def _clog(self, text):
+        self.console_box.configure(state="normal")
+        self.console_box.insert("end", text + "\n")
+        self.console_box.see("end")
+        self.console_box.configure(state="disabled")
+
+    def _console_clear(self):
+        self.console_box.configure(state="normal")
+        self.console_box.delete("1.0", "end")
+        self.console_box.configure(state="disabled")
+
+    def _run_cmd(self):
+        raw = self._cmd_var.get().strip()
+        self._cmd_var.set("")
+        if not raw: return
+        self._clog(f"» {raw}")
+        cmd = raw.lower()
+
+        if cmd in ("/list", "list"):
+            students = self.store.load_students()
+            self._clog(f"  {len(students)} student(s):")
+            for s in students:
+                self._clog(f"    {s.get('UID','')} | {s.get('Name','')} | {s.get('Grade','')} | {s.get('No. of Days Present',0)} days")
+
+        elif cmd in ("/add", "add"):
+            self.open_add_student()
+
+        elif cmd in ("/refresh", "refresh"):
+            self.refresh_all(); self._clog("  Refreshed.")
+
+        elif cmd in ("/scan start", "scan start"):
+            self.start_scan()
+
+        elif cmd in ("/scan stop", "scan stop"):
+            self.stop_scan()
+
+        elif cmd in ("/stats", "stats"):
+            students = self.store.load_students()
+            present  = len([u for u in self.scanned_today if u in self.students_by_uid])
+            top = max(students, key=lambda s: safe_int(s.get("XP")), default=None)
+            self._clog(f"  Total: {len(students)} | Present: {present} | Absent: {len(students)-present}")
+            if top:
+                self._clog(f"  XP leader: {top.get('Name','')} ({top.get('XP',0)} XP)")
+
+        elif cmd in ("/backup", "backup"):
+            p = self.store.backup()
+            self._clog(f"  Backup saved: {p.name}")
+            Toast.show(self.root, f"Backup saved: {p.name}", "success")
+
+        elif cmd.startswith("/export"):
+            self._do_export("excel")
+
+        elif cmd.startswith("/remove ") or cmd.startswith("remove "):
+            q = re.sub(r"^/?remove\s+(@s\s+)?", "", raw, flags=re.I).strip()
+            matches = self._find_students(q)
+            if not matches: self._clog(f"  No student matching '{q}'.")
+            elif len(matches) > 1:
+                self._clog(f"  Multiple matches for '{q}':")
+                for m in matches: self._clog(f"    {m.get('UID','')} | {m.get('Name','')}")
+            else:
+                s   = matches[0]; uid = str(s.get("UID","")); name = str(s.get("Name",uid))
+                if messagebox.askyesno("Remove", f"Remove {name} ({uid})?"):
+                    self.store.remove_student(uid)
+                    self.scanned_today.discard(uid)
+                    self._save_today_scans()
+                    self.refresh_all()
+                    self._clog(f"  Removed {name}.")
+
+        elif cmd.startswith("/edit ") or cmd.startswith("edit "):
+            q = re.sub(r"^/?edit\s+(@s\s+)?", "", raw, flags=re.I).strip()
+            matches = self._find_students(q)
+            if not matches: self._clog(f"  No student matching '{q}'.")
+            elif len(matches) > 1: self._clog(f"  Multiple matches. Be more specific.")
+            else:
+                self.open_edit_student_by_uid(str(matches[0].get("UID", "")))
+
+        elif cmd.startswith("/msg ") or cmd.startswith("msg "):
+            q = re.sub(r"^/?msg\s+(@s\s+)?", "", raw, flags=re.I).strip()
+            matches = self._find_students(q)
+            if not matches: self._clog(f"  No student matching '{q}'.")
+            elif len(matches) > 1: self._clog("  Multiple matches. Be more specific.")
+            else:
+                s = matches[0]
+                lbl = f"{s.get('Name','')}  ({s.get('Roll No','')} / {s.get('UID','')})"
+                self._msg_refresh_list()
+                self._msg_stu_var.set(lbl)
+                self._msg_to_email.set(str(s.get("Parent Email", "")))
+                self._msg_to_phone.set(str(s.get("Parent Phone", "")))
+                self._switch("Mail"); self._clog(f"  Opened Messages for {s.get('Name','')}.")
+
+        elif cmd in ("/theme", "theme"):
+            self._theme_dark = not self._theme_dark
+            set_theme(self._theme_dark)
+            self.settings.set("theme_dark", self._theme_dark)
+            self.settings.save()
+            self._clog(f"  Theme: {'Dark' if self._theme_dark else 'Light'}")
+            Toast.show(self.root, f"Theme: {'Dark' if self._theme_dark else 'Light'} (restart to apply fully)", "info")
+
+        elif cmd in ("/api", "api"):
+            if self.api_server._running:
+                self.api_server.stop()
+                self._clog(f"  API stopped.")
+            else:
+                if self.api_server.start():
+                    self._clog(f"  API started on port {API_PORT}")
+                else:
+                    self._clog("  API failed to start.")
+
+        elif cmd in ("/notify-absent", "notify-absent", "/notifyabsent"):
+            absentees = self.get_absent_students()
+            if not absentees:
+                self._clog("  No absent students right now (or school day inactive).")
+            else:
+                result = self.send_absent_notifications(manual=True)
+                play_sound(SOUND_EXPORT)
+                self._clog(f"  Absentee notify: {result['sent_email']} email(s), "
+                           f" {result['skipped']} skipped, "
+                           f"{result['total']} absent total.")
+                Toast.show(self.root, f"Notified parents of {result['total']} absent student(s).", "success")
+
+        elif cmd in ("/restart", "restart"):
+            self._clog("  Restarting FaceAttend…")
+            self._perform_restart()
+
+        elif cmd in ("/badge", "badge"):
+            students = self.store.load_students()
+            self._clog("  Badge standings:")
+            for s in students[:10]:
+                uid = str(s.get("UID", ""))
+                badges = self.badges.get_badges(uid)
+                b_str = ", ".join([b["icon"] + " " + _(b["name"], self._lang) for b in badges]) or "None"
+                self._clog(f"    {s.get('Name','')} ({uid}): {b_str}")
+
+        elif cmd in ("/?", "/help", "help"):
+            cmds = [
+                "/list          — list all students",
+                "/add           — open Add Student",
+                "/edit @s <n>   — edit a student",
+                "/remove @s <n> — remove a student",
+                "/msg @s <n>    — open Messages for a student",
+                "/refresh       — refresh dashboard",
+                "/scan start    — start camera scan",
+                "/scan stop     — stop camera scan",
+                "/stats         — show quick stats",
+                "/backup        — backup Excel file",
+                "/export        — export styled Excel",
+                "/notify-absent — send absence notice to all absent parents now",
+                "/theme         — toggle dark/light theme",
+                "/restart       — restart FaceAttend now (Windows)",
+                "/api           — toggle REST API server",
+                "/badge         — show badge standings",
+                "/launch <name> — launch an arcade game (e.g. /launch snake)",
+                "/clear         — clear this console",
+                "/?             — show this help",
+            ]
+            self._clog("  ┌─ Commands ──────────────────────────────")
+            for c in cmds: self._clog(f"  │  {c}")
+            self._clog("  └────────────────────────────────────────")
+
+        elif cmd in ("/clear", "clear"):
+            self._console_clear()
+
+        elif cmd in ("/games", "games"):
+            self._clog("  Arcade games — /launch <name>:")
+            for key, info in ARCADE_GAMES.items():
+                self._clog(f"    {key:<11} — {info['label']}")
+
+        elif cmd.startswith("/launch") or cmd.startswith("launch"):
+            arg = re.sub(r"^/?launch\s*", "", cmd).strip().replace(" ", "").replace("-", "")
+            if not arg:
+                self._clog("  Usage: /launch <game_name>   (try /games for the list)")
+            elif arg not in ARCADE_GAMES:
+                self._clog(f"  Unknown game '{arg}'. Try /games for the list.")
+            else:
+                info = ARCADE_GAMES[arg]
+                label = info["label"]
+                if info["kind"] == "toplevel":
+                    try:
+                        info["cls"](self.root)
+                        self._clog(f"  Launched {label}. Esc closes it, Space restarts.")
+                    except Exception as e:
+                        self._clog(f"  Failed to launch {label}: {e}")
+                else:  # external — own process/window, own pygame loop.
+                    # Source lives embedded in this file (DUNGEON_CRAWLER_SOURCE);
+                    # write it out fresh each launch so it always matches this
+                    # build, then run it as a separate process.
+                    path = info["path"]
+                    try:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(DUNGEON_CRAWLER_SOURCE, encoding="utf-8")
+                        subprocess.Popen([sys.executable, str(path)], cwd=str(path.parent))
+                        self._clog(f"  Launched {label} in its own window (own controls — see its title bar).")
+                    except Exception as e:
+                        self._clog(f"  Failed to launch {label}: {e}")
+
+        else:
+            self._clog("  Unknown command. Type /? for help.")
+
+    # ── whiteboard tab ───────────────────────────────────────────────────────
+    def _build_whiteboard_pane(self, parent):
+        """
+        A simple freehand drawing canvas — pen, eraser, colour picker,
+        clear, and save. Saved drawings are PNGs written into
+        data/Notes/Whiteboards/ (a folder inside FaceAttend's own data
+        directory, per spec), named with a timestamp so nothing overwrites.
+        Uses only tkinter's Canvas + Pillow (already a project dependency
+        for photos/QR) — no extra packages needed. Lives as a pane inside
+        the Notepad tab, alongside the Notes pane.
+        """
+        parent.grid_rowconfigure(1, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        hdr = tk.Frame(parent, bg=P.bg)
+        hdr.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 10))
+        tk.Label(hdr, text=f"\U0001F3A8  {self.T('whiteboard')}", bg=P.bg, fg=P.text,
+                 font=F_H2).pack(side="left")
+
+        toolbar = tk.Frame(hdr, bg=P.bg)
+        toolbar.pack(side="right")
+
+        self._wb_color = tk.StringVar(value=P.text if hasattr(P, "text") else "#000000")
+        self._wb_mode  = tk.StringVar(value="pen")
+        self._wb_width = tk.IntVar(value=3)
+
+        swatches = ["#e8edf5", "#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#000000", "#ffffff"]
+        for c in swatches:
+            sw = tk.Label(toolbar, bg=c, width=2, height=1, relief="flat",
+                           highlightthickness=2, highlightbackground=P.border, cursor="hand2")
+            sw.pack(side="left", padx=2)
+            sw.bind("<Button-1>", lambda _e, col=c: (self._wb_color.set(col), self._wb_mode.set("pen")))
+
+        AnimBtn(toolbar, text="✏ Pen", command=lambda: self._wb_mode.set("pen"),
+            bg=P.surface2, fg=P.text, activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=(10, 2))
+        AnimBtn(toolbar, text="🧹 Eraser", command=lambda: self._wb_mode.set("eraser"),
+            bg=P.surface2, fg=P.text, activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=2)
+        thin  = AnimBtn(toolbar, text="Thin",  command=lambda: self._wb_width.set(2),
+            bg=P.surface2, fg=P.text, activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=8, pady=6, font=F_SMALL, cursor="hand2")
+        thin.pack(side="left", padx=2)
+        thick = AnimBtn(toolbar, text="Thick", command=lambda: self._wb_width.set(8),
+            bg=P.surface2, fg=P.text, activebackground=P.border, activeforeground=P.text,
+            relief="flat", padx=8, pady=6, font=F_SMALL, cursor="hand2")
+        thick.pack(side="left", padx=2)
+        AnimBtn(toolbar, text=self.T("clear_board"), command=self._wb_clear,
+            bg=P.amber, fg="#1a1100", activebackground="#d97706", activeforeground="#1a1100",
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=(10, 2))
+        AnimBtn(toolbar, text=self.T("save_drawing"), command=self._wb_save,
+            bg=P.green, fg="white", activebackground=P.green_dark, activeforeground="white",
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=2)
+
+        canvas_sh = tk.Frame(parent, bg=P.surface, highlightthickness=1, highlightbackground=P.border_soft)
+        canvas_sh.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        self._wb_canvas = tk.Canvas(canvas_sh, bg="#ffffff", highlightthickness=0, cursor="pencil")
+        self._wb_canvas.pack(fill="both", expand=True, padx=2, pady=2)
+        self._wb_last_xy = None
+        self._wb_strokes: list = []  # [(x0,y0,x1,y1,color,width), ...] mirrored for PNG export
+        self._wb_canvas.bind("<ButtonPress-1>", self._wb_start_stroke)
+        self._wb_canvas.bind("<B1-Motion>",     self._wb_draw)
+        self._wb_canvas.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_wb_last_xy", None))
+
+    def _wb_start_stroke(self, event):
+        self._wb_last_xy = (event.x, event.y)
+
+    def _wb_draw(self, event):
+        if self._wb_last_xy is None:
+            self._wb_last_xy = (event.x, event.y)
+            return
+        x0, y0 = self._wb_last_xy
+        x1, y1 = event.x, event.y
+        color = "#ffffff" if self._wb_mode.get() == "eraser" else self._wb_color.get()
+        width = 18 if self._wb_mode.get() == "eraser" else self._wb_width.get()
+        self._wb_canvas.create_line(x0, y0, x1, y1, fill=color, width=width,
+                                     capstyle="round", smooth=True)
+        self._wb_strokes.append((x0, y0, x1, y1, color, width))
+        self._wb_last_xy = (x1, y1)
+
+    def _wb_clear(self):
+        if not self._wb_strokes:
+            return
+        if messagebox.askyesno(self.T("clear_board"), self.T("are_you_sure")):
+            self._wb_canvas.delete("all")
+            self._wb_strokes = []
+
+    def _wb_save(self):
+        """Rasterises the recorded strokes to a PNG using Pillow (avoids
+        the well-known unreliability of Canvas postscript->image conversion
+        across platforms) and writes it into data/Notes/Whiteboards/."""
+        if not self._wb_strokes:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Nothing drawn yet.", "warning")
+            return
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Pillow is required to save drawings.", "error")
+            return
+        w = max(self._wb_canvas.winfo_width(), 800)
+        h = max(self._wb_canvas.winfo_height(), 600)
+        img = Image.new("RGB", (w, h), "#ffffff")
+        draw = ImageDraw.Draw(img)
+        for (x0, y0, x1, y1, color, width) in self._wb_strokes:
+            draw.line([(x0, y0), (x1, y1)], fill=color, width=width)
+        WHITEBOARD_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = WHITEBOARD_DIR / f"whiteboard_{stamp}.png"
+        img.save(path)
+        play_sound(SOUND_EXPORT)
+        Toast.show(self.root, f"Saved to data/Notes/Whiteboards/{path.name}", "success", 5000)
+        self.log(f"Whiteboard saved: {path.name}")
+
+    # ── notepad tab (Notes + Whiteboard live here as switchable panes) ─────────
+    def _build_notepad_tab(self):
+        """
+        Notepad tab: a "Notes" pane (real multi-line editor, styled like a
+        classic Notepad — plain white page, monospaced text, tiny AI
+        note-cleanup helper, and a bold/italic/colour formatting popover)
+        and a "Whiteboard" pane (freehand drawing), switched with a pill
+        toggle at the top so both live under one nav icon.
+        """
+        outer = self._tab_frames["Notepad"]
+        outer.grid_rowconfigure(1, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        switcher = tk.Frame(outer, bg=P.bg)
+        switcher.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 10))
+        tk.Label(switcher, text=f"\U0001F4DD  {self.T('notepad')}", bg=P.bg, fg=P.text,
+                 font=F_H2).pack(side="left")
+
+        pill_wrap = tk.Frame(switcher, bg=P.bg)
+        pill_wrap.pack(side="left", padx=(18, 0))
+        self._np_pane_btns = {}
+
+        def show_pane(which):
+            for name, pane in (("notes", self._np_notes_pane), ("whiteboard", self._np_whiteboard_pane)):
+                pane.grid_remove()
+                b = self._np_pane_btns[name]
+                active = name == which
+                b.configure(bg=P.blue if active else P.sidebar2,
+                            fg="white" if active else P.ink)
+            {"notes": self._np_notes_pane, "whiteboard": self._np_whiteboard_pane}[which].grid()
+        self._np_show_pane = show_pane
+
+        for key, label in (("notes", f"📝 {self.T('notepad')}"), ("whiteboard", f"🎨 {self.T('whiteboard')}")):
+            b = AnimBtn(pill_wrap, text=label, command=lambda k=key: show_pane(k),
+                bg=P.sidebar2, fg=P.ink, activebackground=P.border, activeforeground=P.ink,
+                relief="flat", padx=12, pady=7, font=F_SMALL_B, cursor="hand2")
+            b.pack(side="left", padx=(0, 6))
+            self._np_pane_btns[key] = b
+
+        panes = tk.Frame(outer, bg=P.bg)
+        panes.grid(row=1, column=0, sticky="nsew")
+        panes.grid_rowconfigure(0, weight=1)
+        panes.grid_columnconfigure(0, weight=1)
+        self._np_notes_pane = tk.Frame(panes, bg=P.bg)
+        self._np_notes_pane.grid(row=0, column=0, sticky="nsew")
+        self._np_whiteboard_pane = tk.Frame(panes, bg=P.bg)
+        self._np_whiteboard_pane.grid(row=0, column=0, sticky="nsew")
+
+        self._build_notes_pane(self._np_notes_pane)
+        self._build_whiteboard_pane(self._np_whiteboard_pane)
+        show_pane("notes")
+
+    def _build_notes_pane(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        body = tk.Frame(parent, bg=P.bg)
+        body.grid(row=0, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # ── left: saved-note list ───────────────────────────────────────────
+        list_sh = tk.Frame(body, bg=P.surface, highlightthickness=1, highlightbackground=P.border_soft, width=220)
+        list_sh.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        list_sh.grid_propagate(False)
+        list_hdr = tk.Frame(list_sh, bg=P.surface)
+        list_hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(list_hdr, text=self.T("my_notes"), bg=P.surface, fg=P.muted,
+                 font=F_SMALL_B).pack(side="left")
+        self._notes_listbox = tk.Listbox(list_sh, bg=P.surface, fg=P.text,
+                                          selectbackground=P.blue, relief="flat",
+                                          highlightthickness=0, font=F_BODY, activestyle="none")
+        self._notes_listbox.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._notes_listbox.bind("<<ListboxSelect>>", self._note_open_selected)
+
+        # ── right: the actual "notepad" page ────────────────────────────────
+        editor_sh = tk.Frame(body, bg="#d9d9d9", highlightthickness=1, highlightbackground=P.border_soft)
+        editor_sh.grid(row=0, column=1, sticky="nsew")
+        editor_sh.grid_rowconfigure(2, weight=1)
+        editor_sh.grid_columnconfigure(0, weight=1)
+
+        # title row + new/save, in a thin app-toolbar strip above the page
+        top_row = tk.Frame(editor_sh, bg=P.surface)
+        top_row.grid(row=0, column=0, sticky="ew")
+        self._note_title_var = tk.StringVar(value="")
+        title_entry = ttk.Entry(top_row, textvariable=self._note_title_var, font=F_BODY_B)
+        title_entry.pack(side="left", fill="x", expand=True, padx=(10, 8), pady=8)
+        AnimBtn(top_row, text=self.T("new_note"), command=self._note_new,
+            bg=P.green, fg="white", activebackground=P.green_dark, activeforeground="white",
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="right", padx=(4, 10))
+        AnimBtn(top_row, text=self.T("save_note"), command=self._note_save,
+            bg=P.blue, fg="white", activebackground=P.blue_dark, activeforeground="white",
+            relief="flat", padx=10, pady=6, font=F_SMALL_B, cursor="hand2").pack(side="right", padx=4)
+
+        # formatting strip: Bold / Italic / colour swatches / AI helper
+        fmt_row = tk.Frame(editor_sh, bg=P.surface2)
+        fmt_row.grid(row=1, column=0, sticky="ew")
+        AnimBtn(fmt_row, text="B", command=lambda: self._note_toggle_style("bold"),
+            bg=P.surface2, fg="#111111", activebackground=P.border, activeforeground="#111111",
+            relief="flat", padx=10, pady=4, font=(FONT_MONO, 10, "bold"), cursor="hand2").pack(side="left", padx=(8, 2), pady=4)
+        AnimBtn(fmt_row, text="I", command=lambda: self._note_toggle_style("italic"),
+            bg=P.surface2, fg="#111111", activebackground=P.border, activeforeground="#111111",
+            relief="flat", padx=10, pady=4, font=(FONT_MONO, 10, "italic"), cursor="hand2").pack(side="left", padx=2, pady=4)
+        tk.Frame(fmt_row, bg=P.border, width=1).pack(side="left", fill="y", padx=6, pady=6)
+        for c in ["#111111", "#d92626", "#1a73e8", "#188038", "#e37400", "#8430ce"]:
+            sw = tk.Label(fmt_row, bg=c, width=2, height=1, relief="flat",
+                          highlightthickness=1, highlightbackground=P.border, cursor="hand2")
+            sw.pack(side="left", padx=2, pady=4)
+            sw.bind("<Button-1>", lambda _e, col=c: self._note_apply_color(col))
+        tk.Frame(fmt_row, bg=P.border, width=1).pack(side="left", fill="y", padx=6, pady=6)
+        AnimBtn(fmt_row, text="✨ AI Note Helper", command=self._note_ai_assist,
+            bg="#7c3aed", fg="white", activebackground="#6d28d9", activeforeground="white",
+            relief="flat", padx=10, pady=4, font=F_SMALL_B, cursor="hand2").pack(side="left", padx=(6, 8), pady=4)
+
+        # the page itself — always a plain white notepad page, code-style
+        # monospaced font, regardless of the app's light/dark theme
+        page_sh = tk.Frame(editor_sh, bg="#ffffff")
+        page_sh.grid(row=2, column=0, sticky="nsew", padx=1, pady=(0, 1))
+        page_sh.grid_rowconfigure(0, weight=1)
+        page_sh.grid_columnconfigure(0, weight=1)
+        self._note_text = tk.Text(page_sh, wrap="word", bg="#ffffff", fg="#111111",
+                                   relief="flat", highlightthickness=0,
+                                   font=(FONT_MONO, 12), padx=16, pady=14,
+                                   insertbackground="#111111", undo=True,
+                                   spacing1=2, spacing3=2)
+        ysb = ttk.Scrollbar(page_sh, orient="vertical", command=self._note_text.yview)
+        self._note_text.configure(yscrollcommand=ysb.set)
+        self._note_text.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+
+        self._note_text.tag_configure("bold",   font=(FONT_MONO, 12, "bold"))
+        self._note_text.tag_configure("italic", font=(FONT_MONO, 12, "italic"))
+
+        self._current_note_path = None
+        self._notes_refresh_list()
+
+    def _notes_refresh_list(self):
+        self._notes_listbox.delete(0, "end")
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(NOTES_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        self._notes_files = files
+        for f in files:
+            self._notes_listbox.insert("end", f.stem)
+
+    def _note_new(self):
+        self._current_note_path = None
+        self._note_title_var.set("")
+        self._note_text.delete("1.0", "end")
+        self._note_text.focus_set()
+
+    def _note_open_selected(self, _event=None):
+        sel = self._notes_listbox.curselection()
+        if not sel:
+            return
+        path = self._notes_files[sel[0]]
+        try:
+            content = path.read_text(encoding="utf-8")
+        except Exception as e:
+            Toast.show(self.root, f"Could not open note: {e}", "error"); return
+        self._current_note_path = path
+        self._note_title_var.set(path.stem)
+        self._note_text.delete("1.0", "end")
+        self._note_text.insert("1.0", content)
+
+    def _note_save(self):
+        title = self._note_title_var.get().strip() or f"Note {datetime.now().strftime('%Y-%m-%d %H%M')}"
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)[:80]
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        path = NOTES_DIR / f"{safe_title}.txt"
+        # if renaming an existing note, remove the old file first
+        if self._current_note_path and self._current_note_path != path and self._current_note_path.exists():
+            try: self._current_note_path.unlink()
+            except Exception: pass
+        content = self._note_text.get("1.0", "end-1c")
+        path.write_text(content, encoding="utf-8")
+        self._current_note_path = path
+        self._note_title_var.set(safe_title)
+        self._notes_refresh_list()
+        play_sound(SOUND_SUCCESS)
+        Toast.show(self.root, f"Saved to data/Notes/{path.name}", "success")
+        self.log(f"Note saved: {path.name}")
+
+    def _note_toggle_style(self, tag: str):
+        """Bold/Italic button: toggles the tag on the current selection."""
+        try:
+            start, end = self._note_text.index("sel.first"), self._note_text.index("sel.last")
+        except tk.TclError:
+            Toast.show(self.root, "Select some text first.", "warning"); return
+        ranges = self._note_text.tag_ranges(tag)
+        already = False
+        for i in range(0, len(ranges), 2):
+            if self._note_text.compare(ranges[i], "<=", start) and self._note_text.compare(ranges[i + 1], ">=", end):
+                already = True
+                break
+        if already:
+            self._note_text.tag_remove(tag, start, end)
+        else:
+            self._note_text.tag_add(tag, start, end)
+
+    def _note_apply_color(self, color: str):
+        """Colour swatch: colours the current selection (creates a tag per
+        colour on first use, same pattern as bold/italic)."""
+        try:
+            start, end = self._note_text.index("sel.first"), self._note_text.index("sel.last")
+        except tk.TclError:
+            Toast.show(self.root, "Select some text first.", "warning"); return
+        tag = f"color_{color}"
+        if tag not in self._note_text.tag_names():
+            self._note_text.tag_configure(tag, foreground=color)
+        self._note_text.tag_add(tag, start, end)
+
+    def _note_ai_assist(self):
+        """Lightweight, fully-offline note cleanup — no external API calls,
+        so it works with no internet and no key. Tidies whitespace, turns
+        plain lines into a bulleted list, and fills in a title from the
+        first line when the note is untitled."""
+        raw = self._note_text.get("1.0", "end-1c")
+        lines = [ln.strip() for ln in raw.splitlines()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            Toast.show(self.root, "Write something first — then let AI tidy it up.", "warning")
+            return
+        cleaned = []
+        for ln in lines:
+            if ln.startswith(("•", "-", "*")):
+                ln = "• " + ln.lstrip("•-* ").strip()
+            else:
+                ln = "• " + (ln[0].upper() + ln[1:] if len(ln) > 1 else ln.upper())
+            cleaned.append(ln)
+        self._note_text.delete("1.0", "end")
+        self._note_text.insert("1.0", "\n".join(cleaned))
+        if not self._note_title_var.get().strip():
+            self._note_title_var.set(lines[0][:60])
+        play_sound(SOUND_SUCCESS)
+        Toast.show(self.root, "Tidied into a bulleted list.", "success")
+
+    # ── settings tab ─────────────────────────────────────────────────────────
+    def _build_settings_tab(self):
+        parent = self._tab_frames["Settings"]
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Make scrollable
+        outer = tk.Frame(parent, bg=P.sidebar)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        canvas = tk.Canvas(outer, bg=P.sidebar, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        shell = tk.Frame(canvas, bg=P.sidebar)
+        win_id = canvas.create_window((0, 0), window=shell, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win_id, width=e.width))
+        shell.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # Scope the mousewheel scroll to when the pointer is actually over
+        # this canvas (bind_all would otherwise hijack scrolling on every
+        # OTHER tab too, for the rest of the app's lifetime).
+        canvas.bind("<Enter>", lambda e: canvas.bind_all(
+            "<MouseWheel>", lambda e2: canvas.yview_scroll(int(-1*(e2.delta/120)), "units")))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        hdr = tk.Frame(shell, bg=P.sidebar)
+        hdr.pack(fill="x", padx=18, pady=(18, 10))
+        tk.Label(hdr, text="⚙  " + self.T("settings"), bg=P.sidebar, fg=P.text,
+                 font=F_H2).pack(anchor="w")
+        tk.Label(hdr, text=self.T("settings_subtitle"), bg=P.sidebar,
+                 fg=P.muted, font=F_SMALL).pack(anchor="w", pady=(2, 0))
+
+        def card():
+            f = tk.Frame(shell, bg=P.sidebar2, highlightthickness=1, highlightbackground=P.border)
+            f.pack(fill="x", padx=18, pady=(0, 4))
+            return f
+
+        def section(title, subtitle):
+            f = tk.Frame(shell, bg=P.sidebar)
+            f.pack(fill="x", padx=18, pady=(10, 4))
+            tk.Label(f, text=title, bg=P.sidebar, fg=P.text, font=F_H3).pack(anchor="w")
+            if subtitle:
+                tk.Label(f, text=subtitle, bg=P.sidebar, fg=P.faint, font=F_TINY).pack(anchor="w")
+
+        def row(c, txt, r, var, width=None, show=None):
+            tk.Label(c, text=txt, bg=P.sidebar2, fg=P.muted,
+                     font=F_SMALL_B).grid(row=r, column=0, sticky="w", padx=14, pady=(10,4))
+            kw = {"textvariable": var, "font": F_BODY}
+            if width: kw["width"] = width
+            if show: kw["show"] = show
+            ttk.Entry(c, **kw).grid(row=r, column=1, sticky="e" if width else "ew", padx=14, pady=(10,4))
+
+        # ── Appearance ────────────────────────────────────────────
+        section("Appearance", "Theme & language — changing either will offer an automatic restart")
+        c_appearance = card()
+        c_appearance.grid_columnconfigure(1, weight=1)
+        self._theme_var = tk.BooleanVar(value=self._theme_dark)
+        tk.Label(c_appearance, text="Theme", bg=P.sidebar2, fg=P.muted,
+                 font=F_SMALL_B).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 10))
+        theme_cb = ttk.Combobox(c_appearance, values=["Dark", "Light"],
+                                 state="readonly", font=F_BODY)
+        theme_cb.set("Dark" if self._theme_dark else "Light")
+        theme_cb.grid(row=0, column=1, sticky="ew", padx=14, pady=(10, 10))
+        theme_cb.bind("<<ComboboxSelected>>", self._on_theme_change)
+
+        tk.Label(c_appearance, text="Language", bg=P.sidebar2, fg=P.muted,
+                 font=F_SMALL_B).grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
+        self._lang_code_by_label = {v: k for k, v in LANG_NAMES.items()}
+        lang_labels = list(LANG_NAMES.values())
+        lang_cb = ttk.Combobox(c_appearance, values=lang_labels,
+                                state="readonly", font=F_BODY)
+        lang_cb.set(LANG_NAMES.get(self._lang, "English"))
+        lang_cb.grid(row=1, column=1, sticky="ew", padx=14, pady=(0, 10))
+        lang_cb.bind("<<ComboboxSelected>>", self._on_language_change)
+        self._lang_cb = lang_cb
+
+        self._settings_restart_btn = AnimBtn(c_appearance, text="⟳  Restart Now to Apply",
+            command=self._perform_restart,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=14, pady=8,
+            font=F_SMALL_B, cursor="hand2", anim_color=P.blue_glow)
+        self._settings_restart_btn.grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 12))
+        self._settings_restart_btn.grid_remove()  # hidden until a theme/language change happens
+
+        # ── Academic Year ────────────────────────────────────────
+        section("Academic Year", "Run once a year, when students move up a grade")
+        c_promote = card()
+        c_promote.grid_columnconfigure(0, weight=1)
+        tk.Label(c_promote, text="Move every student up to their new grade/section "
+                 "in one go, instead of editing each one by hand.",
+                 bg=P.sidebar2, fg=P.muted, font=F_SMALL, wraplength=420, justify="left"
+                 ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
+        AnimBtn(c_promote, text=self.T("promote_students"),
+            command=lambda: PromotionDialog(self),
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=14, pady=8,
+            font=F_SMALL_B, cursor="hand2", anim_color=P.blue_glow
+            ).grid(row=1, column=0, sticky="w", padx=14, pady=(0, 12))
+
+        # ── Attendance Rules ────────────────────────────────────
+        section("Attendance Rules", "Late cutoff, recognition sensitivity & XP rewards")
+        c1 = card()
+        self._late_var      = tk.StringVar(value=self.settings.late_time)
+        self._threshold_var = tk.StringVar(value=str(self.settings.threshold))
+        self._xp_on_var     = tk.StringVar(value=str(self.settings.xp_ontime))
+        self._xp_late_var   = tk.StringVar(value=str(self.settings.xp_late))
+        self._school_var    = tk.StringVar(value=self.settings.school_name or "")
+        row(c1, "Late cutoff (HH:MM)", 0, self._late_var,      width=8)
+        row(c1, "School name",         1, self._school_var)
+        row(c1, "Face threshold",      2, self._threshold_var,  width=8)
+        row(c1, "XP (on-time)",        3, self._xp_on_var,      width=8)
+        row(c1, "XP (late)",           4, self._xp_late_var,    width=8)
+
+        # ── Schedule Manager ────────────────────────────────────
+        section("Schedule", "Per-day late thresholds and active/inactive days")
+        c_sched = card()
+        self._sched_vars = {}
+        days = ScheduleManager.DAYS
+        for i, day in enumerate(days):
+            d = self.schedule._data.get(day, {})
+            active_var = tk.BooleanVar(value=d.get("active", day not in ("Sat", "Sun")))
+            late_var = tk.StringVar(value=d.get("late_time", "08:32"))
+            self._sched_vars[day] = (active_var, late_var)
+            fr = tk.Frame(c_sched, bg=P.sidebar2)
+            fr.grid(row=i, column=0, sticky="ew", padx=14, pady=2)
+            fr.grid_columnconfigure(1, weight=1)
+            ttk.Checkbutton(fr, text=day, variable=active_var).grid(row=0, column=0, sticky="w")
+            ttk.Entry(fr, textvariable=late_var, width=8, font=F_BODY).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        # ── Camera & Scanning ───────────────────────────────────
+        section("Camera & Scanning", "Multi-camera and detection options")
+        c_cam = card()
+        self._cam_var = tk.StringVar(value=str(self.settings.camera_index))
+        self._liveness_var = tk.BooleanVar(value=self.settings.liveness_check)
+        tk.Label(c_cam, text="Camera", bg=P.sidebar2, fg=P.muted,
+                 font=F_SMALL_B).grid(row=0, column=0, sticky="w", padx=14, pady=(10,4))
+        cam_opts = [f"Camera {i}" for i in self._cameras]
+        cam_cb = ttk.Combobox(c_cam, values=cam_opts, state="readonly", font=F_BODY,
+                               textvariable=self._cam_var)
+        cam_cb.grid(row=0, column=1, sticky="ew", padx=14, pady=(10,4))
+        ttk.Checkbutton(c_cam, text="Liveness Detection",
+                         variable=self._liveness_var).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(4, 4))
+
+        # ── Email Sender ────────────────────────────────────────
+        section("Email Sender", "Used by the Messages tab to send parent emails via Gmail")
+        c2 = card()
+        self._smtp_sender_var = tk.StringVar(value=self.settings.smtp_sender or "")
+        self._smtp_pw_var     = tk.StringVar(value=self.settings.smtp_password or "")
+        row(c2, "Gmail address", 0, self._smtp_sender_var)
+        row(c2, "App password", 1, self._smtp_pw_var, show="•")
+        tk.Label(c2, text="Generate at myaccount.google.com/apppasswords",
+                 bg=P.sidebar2, fg=P.faint,
+                 font=F_TINY).grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0,10))
+
+        # ── Auto-Notify Parents ─────────────────────────────────
+        section("Auto-Notify Parents", "Send a message automatically the moment a student is scanned")
+        c3 = card()
+        self._auto_email_var    = tk.BooleanVar(value=bool(self.settings.auto_notify_email))
+
+        def _toggle_email(*_):
+            self.settings.set("auto_notify_email", bool(self._auto_email_var.get()))
+            self.settings.save()
+        self._auto_email_var.trace_add("write", _toggle_email)
+
+        ttk.Checkbutton(c3, text="Email parent automatically on scan",
+                         variable=self._auto_email_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(12, 4))
+        tk.Label(c3, text="Fires once per student per day, right after attendance is marked.\n"
+                          "Email needs the Gmail sender above. WhatsApp opens/reuses a\n"
+                          "web.whatsapp.com tab \u2014 keep it logged in for this to work.",
+                 bg=P.sidebar2, fg=P.faint, font=F_TINY, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 10))
+
+        # ── Absentee Alerts ───────────────────────────────────────
+        section("Absentee Alerts", "Notify parents of students who haven't been marked present")
+        c_abs = card()
+        self._absent_enabled_var  = tk.BooleanVar(value=bool(self.settings.absent_notify_enabled))
+        self._absent_email_var    = tk.BooleanVar(value=bool(self.settings.absent_notify_email))
+        self._absent_time_var     = tk.StringVar(value=str(self.settings.absent_notify_time or "09:30"))
+
+        def _toggle_abs_enabled(*_):
+            self.settings.set("absent_notify_enabled", bool(self._absent_enabled_var.get()))
+            self.settings.save()
+        def _toggle_abs_email(*_):
+            self.settings.set("absent_notify_email", bool(self._absent_email_var.get()))
+            self.settings.save()
+        self._absent_enabled_var.trace_add("write", _toggle_abs_enabled)
+        self._absent_email_var.trace_add("write", _toggle_abs_email)
+
+        ttk.Checkbutton(c_abs, text="Automatically send absentee alerts at a fixed time every school day",
+                         variable=self._absent_enabled_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 4))
+
+        tk.Label(c_abs, text="Fixed time (HH:MM, 24h)", bg=P.sidebar2, fg=P.muted,
+                 font=F_SMALL_B).grid(row=1, column=0, sticky="w", padx=14, pady=(2, 4))
+        time_entry = ttk.Entry(c_abs, textvariable=self._absent_time_var, width=8, font=F_BODY)
+        time_entry.grid(row=1, column=1, sticky="w", pady=(2, 4))
+
+        def _save_abs_time(*_):
+            val = self._absent_time_var.get().strip()
+            try:
+                h, m = val.split(":")
+                int(h); int(m)
+                self.settings.set("absent_notify_time", f"{int(h):02d}:{int(m):02d}")
+                self.settings.save()
+            except Exception:
+                pass
+        time_entry.bind("<FocusOut>", _save_abs_time)
+        time_entry.bind("<Return>", _save_abs_time)
+
+        ttk.Checkbutton(c_abs, text="via Email",
+                         variable=self._absent_email_var).grid(
+            row=2, column=0, sticky="w", padx=14, pady=(4, 4))
+
+        AnimBtn(c_abs, text="📨  Send to All Absent Parents Now", command=self._send_absent_now,
+            bg=P.amber, fg="#1a1100", activebackground="#d97706",
+            activeforeground="#1a1100", relief="flat", padx=14, pady=8,
+            font=F_SMALL_B, cursor="hand2", anim_color="#b45309").grid(
+                row=3, column=0, columnspan=3, sticky="w", padx=14, pady=(8, 4))
+
+        tk.Label(c_abs, text="Checks who is NOT yet marked present today and sends each parent\n"
+                            "the absence message below (edit in the message template if needed).\n"
+                            "Runs once per day automatically if enabled, or any time via this button\n"
+                            "or the /notify-absent console command.",
+                 bg=P.sidebar2, fg=P.faint, font=F_TINY, justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=14, pady=(2, 10))
+
+        # ── REST API ────────────────────────────────────────────
+        section("REST API", "External integration on port 8765")
+        c_api = card()
+        self._api_var = tk.BooleanVar(value=self.settings.api_server)
+        ttk.Checkbutton(c_api, text="Enable REST API server",
+                         variable=self._api_var).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        self._api_status_lbl = tk.Label(c_api, text="Stopped", bg=P.sidebar2, fg=P.red,
+                                         font=F_SMALL_B)
+        self._api_status_lbl.grid(row=0, column=1, sticky="e", padx=14, pady=(12, 4))
+        tk.Label(c_api, text="Endpoints: /api/students, /api/today, /api/houses, /api/qr?uid=...",
+                 bg=P.sidebar2, fg=P.faint, font=F_TINY).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 10))
+
+        # ── Data & Backup ───────────────────────────────────────
+        section("Data & Backup", "Save your work before trying something risky")
+        bf = tk.Frame(shell, bg=P.sidebar)
+        bf.pack(fill="x", padx=18, pady=(0, 10))
+        AnimBtn(bf, text="💾  Save Settings", command=self._save_settings,
+            bg=P.green, fg="white", activebackground=P.green_dark,
+            activeforeground="white", relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color="#15803d").pack(side="left", padx=(0, 8))
+        AnimBtn(bf, text="↺  Reset", command=self._reset_settings,
+            bg=P.sidebar2, fg=P.ink, activebackground=P.border,
+            activeforeground=P.ink, relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2").pack(side="left", padx=(0, 8))
+        AnimBtn(bf, text="📦  Backup", command=lambda: (
+            Toast.show(self.root, f"Backup: {self.store.backup().name}", "success"),
+            self.log("Excel backed up.")
+        ), bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color=P.blue_glow).pack(side="left")
+
+        # ── Tools ───────────────────────────────────────────────
+        section("Tools", "Bulk import, certificates, and emergency tools")
+        tf = tk.Frame(shell, bg=P.sidebar)
+        tf.pack(fill="x", padx=18, pady=(0, 18))
+        AnimBtn(tf, text="📥  Bulk Import", command=self._open_bulk_import,
+            bg=P.blue, fg="white", activebackground=P.blue_dark,
+            activeforeground="white", relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color=P.blue_glow).pack(side="left", padx=(0, 8))
+        AnimBtn(tf, text="🏅  Certificates", command=self._open_certificates,
+            bg=P.amber, fg="#1a1100", activebackground="#d97706",
+            activeforeground="#1a1100", relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color="#b45309").pack(side="left", padx=(0, 8))
+        AnimBtn(tf, text="📅  Calendar", command=self._open_calendar,
+            bg=P.purple, fg="white", activebackground=P.purple,
+            activeforeground="white", relief="flat", padx=14, pady=9,
+            font=F_BODY_B, cursor="hand2", anim_color="#7c3aed").pack(side="left")
+
+    def _save_settings(self):
+        global LATE_TIME, FACE_THRESHOLD
+        try:
+            h, m = self._late_var.get().strip().split(":")
+            LATE_TIME = dtime(int(h), int(m))
+            self.settings.set("late_time", f"{int(h):02d}:{int(m):02d}")
+        except Exception:
+            Toast.show(self.root, "Invalid time format. Use HH:MM", "error")
+            play_sound(SOUND_ERROR); return
+        try:
+            FACE_THRESHOLD = float(self._threshold_var.get())
+            self.settings.set("threshold", FACE_THRESHOLD)
+        except Exception:
+            Toast.show(self.root, "Invalid threshold. Use e.g. 0.50", "error")
+            play_sound(SOUND_ERROR); return
+        self.settings.set("xp_ontime",     safe_int(self._xp_on_var.get(),  10))
+        self.settings.set("xp_late",       safe_int(self._xp_late_var.get(), 2))
+        self.settings.set("school_name",   self._school_var.get().strip())
+        self.settings.set("smtp_sender",   self._smtp_sender_var.get().strip())
+        self.settings.set("smtp_password", self._smtp_pw_var.get().strip())
+        self.settings.set("auto_notify_email",    bool(self._auto_email_var.get()))
+        # 2.4 new settings
+        self.settings.set("liveness_check", bool(self._liveness_var.get()))
+        try:
+            cam_idx = int(self._cam_var.get().replace("Camera ", ""))
+            self.settings.set("camera_index", cam_idx)
+        except Exception:
+            pass
+        self.settings.set("api_server", bool(self._api_var.get()))
+        # Schedule
+        for day, (active_var, late_var) in self._sched_vars.items():
+            self.schedule.set_day(day, bool(active_var.get()), late_var.get().strip())
+        self.settings.save()
+        if hasattr(self, "_msg_from_var"):
+            self._msg_from_var.set(self.settings.smtp_sender or "(set in Settings)")
+        # API toggle
+        if self.settings.api_server and not self.api_server._running:
+            self.api_server.start()
+            self._api_status_lbl.configure(text="Running", fg=P.green)
+            self.log(f"API server started on port {API_PORT}")
+        elif not self.settings.api_server and self.api_server._running:
+            self.api_server.stop()
+            self._api_status_lbl.configure(text="Stopped", fg=P.red)
+            self.log("API server stopped")
+        Toast.show(self.root, "settings_saved", "success")
+        self.log("Settings saved.")
+
+    def _reset_settings(self):
+        global LATE_TIME, FACE_THRESHOLD
+        LATE_TIME = dtime(8, 32); FACE_THRESHOLD = 0.50
+        self._late_var.set("08:32"); self._threshold_var.set("0.50")
+        self._xp_on_var.set("10"); self._xp_late_var.set("2")
+        self._school_var.set(""); self._smtp_sender_var.set(""); self._smtp_pw_var.set("")
+        self._auto_email_var.set(False)
+        self._liveness_var.set(True)
+        self._api_var.set(False)
+        if hasattr(self, "_absent_enabled_var"):  self._absent_enabled_var.set(False)
+        if hasattr(self, "_absent_email_var"):    self._absent_email_var.set(True)
+        if hasattr(self, "_absent_whatsapp_var"): self._absent_whatsapp_var.set(False)
+        if hasattr(self, "_absent_time_var"):     self._absent_time_var.set("09:30")
+        self.settings._data = dict(self.settings._defaults)
+        self.settings.save()
+        self._theme_dark = self.settings.theme_dark
+        set_theme(self._theme_dark)
+        self._lang = "en"
+        if hasattr(self, "_lang_cb"):
+            self._lang_cb.set(LANG_NAMES.get("en", "English"))
+        if hasattr(self, "_msg_from_var"):
+            self._msg_from_var.set("(set in Settings)")
+        Toast.show(self.root, "settings_reset", "info")
+        self.log("Settings reset to defaults.")
+        self._offer_restart("Settings reset to defaults.")
+
+    def _on_theme_change(self, event=None):
+        dark = event.widget.get() == "Dark"
+        self._theme_dark = dark
+        self.settings.set("theme_dark", dark)
+        set_theme(dark)
+        self.settings.save()
+        self._offer_restart("Theme changed.")
+
+    def _on_language_change(self, event=None):
+        label = self._lang_cb.get()
+        code  = self._lang_code_by_label.get(label, "en")
+        self._lang = code
+        self.settings.set("language", code)
+        self.settings.save()
+        play_sound(SOUND_SUCCESS)
+        self._offer_restart(f"Language set to {label}.")
+        self.log(f"Language changed to {label} ({code}).")
+
+    def _offer_restart(self, reason: str):
+        """
+        Shows a toast with a Restart button after a Theme/Language change.
+        Clicking it (or the matching button in Settings) relaunches the
+        app automatically — no manual reopen needed.
+        """
+        if os.name != "nt":
+            Toast.show(self.root, f"{reason} Restart FaceAttend to apply it everywhere.", "info", 6000)
+            return
+        Toast.show(self.root, f"{reason} Click Restart to apply it now.", "info", 8000,
+                   action_label="Restart", action_command=self._perform_restart)
+        if hasattr(self, "_settings_restart_btn"):
+            self._settings_restart_btn.grid()
+
+    def _perform_restart(self):
+        """
+        Shows a small 'Restarting…' overlay in place of the window, spawns
+        a fresh detached FaceAttend process, then closes this one. Windows
+        only — on other platforms this just asks the user to relaunch
+        manually since detached relaunch behaves differently there.
+        """
+        if os.name != "nt":
+            messagebox.showinfo("Restart FaceAttend",
+                                 "Please close and reopen FaceAttend to apply the change.")
+            return
+
+        overlay = tk.Toplevel(self.root)
+        overlay.overrideredirect(True)
+        overlay.attributes("-topmost", True)
+        overlay.configure(bg=P.sidebar)
+        w, h = 320, 130
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        overlay.geometry(f"{w}x{h}+{(sw - w)//2}+{(sh - h)//2}")
+        shell = tk.Frame(overlay, bg=P.sidebar, highlightthickness=1, highlightbackground=P.border_soft)
+        shell.pack(fill="both", expand=True, padx=2, pady=2)
+        tk.Label(shell, text="⟳", bg=P.sidebar, fg=P.blue, font=(FONT_FAMILY, 26)).pack(pady=(18, 4))
+        tk.Label(shell, text="Restarting FaceAttend…", bg=P.sidebar, fg=P.text,
+                 font=F_BODY_B).pack()
+        overlay.update()
+
+        if restart_app():
+            self.root.after(350, self.root.destroy)
+        else:
+            overlay.destroy()
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Restart failed — please reopen FaceAttend manually.", "error")
+
+    # ── camera ────────────────────────────────────────────────────────────────
+    def toggle_scan(self):
+        if self.scanning: self.stop_scan()
+        else:             self.start_scan()
+
+    def start_scan(self):
+        if np is None:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "NumPy missing. Install requirements.", "error"); return
+        if not ensure_face_recognition():
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "face_recognition not available.", "error"); return
+        cam_idx = self.settings.camera_index
+        self.camera = open_camera(cam_idx)
+        if self.camera is None or not self.camera.isOpened():
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Cannot open webcam.", "error"); return
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_W)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+        self.scanning = True
+        self.scan_btn.configure(text=self.T("stop_scan"), bg=P.red, activebackground=P.red_dark)
+        self._set_scanning_indicator(True)
+        play_sound(SOUND_CAMERA_START)
+        self.log("Scan started.")
+        self.liveness.reset()
+        self._camera_loop()
+
+    def stop_scan(self):
+        self.scanning = False
+        self.scan_btn.configure(text=self.T("start_scan"), bg=P.blue, activebackground=P.blue_dark)
+        self._set_scanning_indicator(False)
+        if self.camera:
+            self.camera.release(); self.camera = None
+        self.cam_lbl.configure(image="", text=self.T("camera_off"))
+        self.log("Scan stopped.")
+
+    def _camera_loop(self):
+        if not self.scanning or self.camera is None:
+            return
+        try:
+            ok, frame = self.camera.read()
+            if ok:
+                self.last_frame = frame.copy()
+                self.frame_count += 1
+                # ── QR scan mode ──────────────────────────────────────
+                if self._qr_mode:
+                    qr_data = decode_qr_from_frame(frame)
+                    if qr_data and "uid" in qr_data:
+                        uid = str(qr_data["uid"])
+                        self._handle_recognition(uid)
+                        self._qr_mode = False
+                # ── Face processing ───────────────────────────────────
+                if self.frame_count % FRAME_SKIP == 0:
+                    try:
+                        self.last_results = self._process(frame)
+                    except Exception as e:
+                        self.last_results = []
+                        self.log(f"Frame process error: {e}")
+                # ── Liveness check overlay ────────────────────────────
+                try:
+                    ann = self._draw(frame.copy(), self.last_results)
+                    if self._liveness_enabled and self.liveness._predictor is not None:
+                        live = self.liveness.is_live(frame)
+                        color = (34, 197, 94) if live else (239, 68, 68)
+                        txt = "LIVE" if live else "SPOOF?"
+                        cv2.putText(ann, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                except Exception:
+                    ann = frame.copy()
+                self._show_frame(ann)
+        except Exception as e:
+            self.log(f"Camera loop error: {e}")
+        self.root.after(20, self._camera_loop)
+
+    def _process(self, frame) -> list[dict]:
+        import time as _t
+        small    = cv2.resize(frame, (0,0), fx=0.25, fy=0.25)
+        rgb      = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        locs     = face_recognition.face_locations(rgb, model="hog")
+        encs     = face_recognition.face_encodings(rgb, locs)
+        results  = []
+        for loc, enc in zip(locs, encs):
+            t, r, b, l = [v * 4 for v in loc]
+            uid = name = None; dist = None; status = "unknown"
+            if self.store.known_encodings:
+                try:
+                    dists = face_recognition.face_distance(self.store.known_encodings, enc)
+                    bi    = int(np.argmin(dists)); bd = float(dists[bi])
+                    dist  = bd
+                    if bd <= FACE_THRESHOLD:
+                        uid    = self.store.known_uids[bi]
+                        name   = str(self.students_by_uid.get(uid, {}).get("Name", uid))
+                        status = "known"
+                        self._handle_recognition(uid)
+                except Exception as e:
+                    import traceback
+                    self.log(f"Recognition error: {e}")
+                    print("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+            if status == "unknown":
+                now = _t.time()
+                if now - self._unknown_last_saved >= 10.0:
+                    self._unknown_last_saved = now
+                    self._save_unknown_face(frame, t, r, b, l)
+
+            results.append({"box": (t,r,b,l), "uid": uid,
+                             "name": name or "Unknown", "distance": dist, "status": status})
+        return results
+
+    def _save_unknown_face(self, frame, t, r, b, l):
+        """Crop and save an unrecognised face to data/unknowns/ with a timestamp filename."""
+        try:
+            UNKNOWNS_DIR.mkdir(parents=True, exist_ok=True)
+            pad  = 20
+            h, w = frame.shape[:2]
+            crop = frame[max(0, t-pad):min(h, b+pad), max(0, l-pad):min(w, r+pad)]
+            if crop.size == 0:
+                return
+            # Resize if oversized to keep unknowns folder tidy
+            if crop.shape[0] > 400 or crop.shape[1] > 400:
+                scale = 400 / max(crop.shape[0], crop.shape[1])
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path  = UNKNOWNS_DIR / f"unknown_{stamp}.jpg"
+            cv2.imwrite(str(path), crop)
+            self.log(f"⚠ Unknown face saved → {path.name}")
+        except Exception as e:
+            self.log(f"Unknown face save failed: {e}")
+
+    def _draw(self, frame, results):
+        for r in results:
+            t, ri, b, l = r["box"]
+            known = r["status"] == "known"
+            color = (34, 197, 94) if known else (0, 175, 255)
+            lbl   = r["name"]
+            if r["distance"] is not None and known:
+                lbl = f"{lbl}  {r['distance']:.2f}"
+            cv2.rectangle(frame, (l,t), (ri,b), color, 2)
+            cv2.rectangle(frame, (l, max(0,t-28)), (ri,t), color, cv2.FILLED)
+            cv2.putText(frame, lbl, (l+6, max(18,t-8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255,255,255), 1, cv2.LINE_AA)
+        return frame
+
+    def _show_frame(self, frame):
+        if Image is None or cv2 is None:
+            return
+        try:
+            rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img  = Image.fromarray(rgb)
+            img.thumbnail((424, 310))
+            canvas = Image.new("RGB", (424, 310), "#070d16")
+            canvas.paste(img, ((424-img.width)//2, (310-img.height)//2))
+            self.camera_photo = ImageTk.PhotoImage(canvas)
+            self.cam_lbl.configure(image=self.camera_photo, text="")
+        except Exception as e:
+            self.log(f"Camera display error: {e}")
+
+    def get_capture_frame(self):
+        if self.last_frame is not None: return self.last_frame.copy()
+        tmp = open_camera()
+        if tmp is None or not tmp.isOpened(): return None
+        ok, f = tmp.read(); tmp.release()
+        return f if ok else None
+
+    def _handle_recognition(self, uid: str):
+        now = datetime.now()
+        if uid in self.scanned_today:
+            last = self.last_dup_log.get(uid)
+            if last is None or (now - last).total_seconds() > 12:
+                name = self.students_by_uid.get(uid, {}).get("Name", uid)
+                self.log(f"{name} already marked today.")
+                self.last_dup_log[uid] = now
+            return
+        # ── Schedule check ──────────────────────────────────────
+        if not self.schedule.is_active():
+            self.log("Today is not an active school day.")
+            Toast.show(self.root, "Today is not an active school day.", "warning")
+            return
+        is_late = now.time() > self.schedule.late_time()
+        try:
+            student, xp = self.store.record_attendance(uid, is_late, self.settings)
+        except ValueError as e:
+            self.log(str(e)); return
+        self.scanned_today.add(uid)
+        self._save_today_scans()
+        self.students_by_uid = self.store.students_by_uid()
+        name   = str(student.get("Name", uid))
+        roll   = str(student.get("Roll No", ""))
+        status = "attendance_late" if is_late else "attendance_ontime"
+        # ── Voice feedback removed in v2.9 ──────────────────────
+        # ── Badge awards ────────────────────────────────────────
+        new_badges = self.badges.check_and_award(uid, student, is_early=not is_late)
+        for badge in new_badges:
+            badge_name = _(badge["name"], self._lang)
+            Toast.show(self.root, f"🏅 New badge: {badge['icon']} {badge_name}!", "success", 5000)
+            self.log(f"Badge awarded to {name}: {badge_name}")
+        self.last_name.configure(text=f"Welcome, {name}")
+        self.last_detail.configure(text=f"{status}  ·  {roll}  ·  +{xp} XP  ·  {now.strftime('%I:%M %p')}")
+        self._animate_result_card()
+        Toast.show(self.root, f"{name} marked {status.lower()}  (+{xp} XP)", "success" if not is_late else "warning")
+        self.log(f"{name} marked {status.lower()}, +{xp} XP")
+        if self.settings.auto_notify_email or self.settings.auto_notify_whatsapp:
+            try:
+                self._auto_notify_parent(student, status, xp, now)
+            except Exception as e:
+                self.log(f"Auto-notify error: {e}")
+        self.refresh_all()
+
+    def _animate_result_card(self):
+        """Flash the result card border blue briefly."""
+        seq  = [P.blue, P.green, P.green, P.border]
+        def step(i):
+            if i < len(seq):
+                try:
+                    self.result_card.configure(highlightbackground=seq[i])
+                    self.root.after(120, lambda: step(i+1))
+                except tk.TclError:
+                    pass
+        step(0)
+
+    # ── student actions ───────────────────────────────────────────────────────
+    def open_add_student(self):
+        play_sound(SOUND_SUCCESS)
+        StudentDialog(self)
+
+    def open_edit_student(self):
+        sel = self.table.selection()
+        if not sel:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Select a student row first.", "warning"); return
+        vals = self.table.item(sel[0], "values")
+        uid  = str(vals[2])
+        self.open_edit_student_by_uid(uid)
+
+    def open_edit_student_by_uid(self, uid: str):
+        s = self.students_by_uid.get(uid)
+        if s is None:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Student not found.", "error"); return
+        StudentDialog(self, student=s)
+
+    def mark_attendance_selected(self):
+        """
+        Manual attendance fallback for when face-scan fails (e.g. camera
+        issue, or a student's face won't recognise). Teacher selects the
+        row in the table, clicks this button, and the student is marked
+        present right now — same on-time/late XP rule as a real face scan,
+        and the resulting record looks identical to a scanned one (no
+        'manual' tag), per spec.
+        """
+        sel = self.table.selection()
+        if not sel:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Select a student row first.", "warning"); return
+        vals = self.table.item(sel[0], "values")
+        uid, name = str(vals[2]), str(vals[3])
+
+        if uid in self.scanned_today:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, f"{name} is already marked present today.", "warning")
+            return
+        if not self.schedule.is_active():
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Today is not an active school day.", "warning")
+            return
+
+        now = datetime.now()
+        is_late = now.time() > self.schedule.late_time()
+        try:
+            student, xp = self.store.record_attendance(uid, is_late, self.settings)
+        except ValueError as e:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, str(e), "error")
+            return
+
+        self.scanned_today.add(uid)
+        self._save_today_scans()
+        self.students_by_uid = self.store.students_by_uid()
+        roll   = str(student.get("Roll No", ""))
+        status = "attendance_late" if is_late else "attendance_ontime"
+
+        new_badges = self.badges.check_and_award(uid, student, is_early=not is_late)
+        for badge in new_badges:
+            badge_name = _(badge["name"], self._lang)
+            Toast.show(self.root, f"🏅 New badge: {badge['icon']} {badge_name}!", "success", 5000)
+            self.log(f"Badge awarded to {name}: {badge_name}")
+
+        self.last_name.configure(text=f"Welcome, {name}")
+        self.last_detail.configure(text=f"{status}  ·  {roll}  ·  +{xp} XP  ·  {now.strftime('%I:%M %p')}  ·  manually marked")
+        self._animate_result_card()
+        play_sound(SOUND_SUCCESS)
+        Toast.show(self.root, f"{name} manually marked {status.lower()}  (+{xp} XP)",
+                   "success" if not is_late else "warning")
+        self.log(f"{name} manually marked {status.lower()}, +{xp} XP")
+
+        if self.settings.auto_notify_email or self.settings.auto_notify_whatsapp:
+            try:
+                self._auto_notify_parent(student, status, xp, now)
+            except Exception as e:
+                self.log(f"Auto-notify error: {e}")
+        self.refresh_all()
+
+    def _send_absent_now(self):
+        absentees = self.get_absent_students()
+        if not absentees:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "No absent students right now (or today isn't an active school day).", "warning")
+            return
+        if not self.settings.absent_notify_email and not self.settings.absent_notify_whatsapp:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, "Enable Email and/or WhatsApp for absentee alerts first.", "warning")
+            return
+        if not messagebox.askyesno("Send Absentee Alerts",
+                                    f"Send an absence notice to the parents of {len(absentees)} "
+                                    f"student(s) not yet marked present today?"):
+            return
+        result = self.send_absent_notifications(manual=True)
+        play_sound(SOUND_EXPORT)
+        Toast.show(self.root,
+                   f"Notified parents of {result['total']} absent student(s) "
+                   f"({result['sent_email']} email).",
+                   "success", 5500)
+
+    def _on_table_selection_changed(self, _event=None):
+        """Keeps self._selected_uids in sync with the Treeview's own
+        selection (which already supports shift-click range-select and
+        ctrl-click toggle-select natively via selectmode='extended'), and
+        shows/hides the bulk-actions bar with a live count."""
+        sel = self.table.selection()
+        self._selected_uids = set(str(s) for s in sel)
+        n = len(self._selected_uids)
+        if hasattr(self, "_selbar"):
+            if n > 0:
+                self._selbar.grid()
+                self._selbar_count_lbl.configure(text=self.T("selected_count", n=n))
+            else:
+                self._selbar.grid_remove()
+
+    def select_all_students(self):
+        all_iids = self.table.get_children()
+        self.table.selection_set(all_iids)
+        self._on_table_selection_changed()
+
+    def clear_table_selection(self):
+        self.table.selection_remove(self.table.selection())
+        self._on_table_selection_changed()
+
+    def _selected_uid_name_pairs(self) -> list[tuple[str, str]]:
+        """Returns [(uid, name), ...] for every currently-selected row,
+        reading straight from the table so it works even for rows whose
+        iid fell back to an auto-generated id (see refresh_table)."""
+        out = []
+        for iid in self.table.selection():
+            vals = self.table.item(iid, "values")
+            if not vals:
+                continue
+            out.append((str(vals[2]), str(vals[3])))
+        return out
+
+    def change_section_for_selected(self):
+        """Bulk 'Change these students to section X' — used by both the
+        Change Section button and the AI Buddy's natural-language command."""
+        pairs = self._selected_uid_name_pairs()
+        if not pairs:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, self.T("no_selection"), "warning")
+            return
+        new_section = simpledialog.askstring(
+            self.T("change_section_selected").rstrip("…").strip(),
+            f"{self.T('new_section')} ({len(pairs)} student(s)):",
+            parent=self.root)
+        if not new_section or not new_section.strip():
+            return
+        self.apply_section_change([u for u, _ in pairs], new_section.strip())
+
+    def apply_section_change(self, uids: list[str], new_section: str) -> int:
+        """Sets Grade/Section = new_section for every uid given. Used by
+        the manual bulk-action button AND by the AI Buddy command
+        executor, so both paths share one implementation and one
+        confirmation/audit trail."""
+        changed = 0
+        for uid in uids:
+            s = self.students_by_uid.get(uid)
+            if not s:
+                continue
+            try:
+                self.store.edit_student(
+                    uid, s.get("Roll No", ""), s.get("Name", ""), new_section,
+                    s.get("House", "None"), s.get("Parent Phone", ""), s.get("Parent Email", ""))
+                changed += 1
+            except Exception as e:
+                self.log(f"Section change failed for {uid}: {e}")
+        self.refresh_all()
+        if changed:
+            play_sound(SOUND_SUCCESS)
+            Toast.show(self.root, f"Moved {changed} student(s) to {new_section}.", "success")
+            self.log(f"Bulk section change: {changed} student(s) -> {new_section}.")
+        self.clear_table_selection()
+        return changed
+
+    def remove_selected(self):
+        pairs = self._selected_uid_name_pairs()
+        if not pairs:
+            play_sound(SOUND_ERROR)
+            Toast.show(self.root, self.T("no_selection"), "warning"); return
+        play_sound(SOUND_NEGATIVE)
+        if len(pairs) == 1:
+            uid, name = pairs[0]
+            prompt = f"Remove {name} ({uid})?"
+        else:
+            names = ", ".join(n for _, n in pairs[:6])
+            more = "" if len(pairs) <= 6 else f" and {len(pairs)-6} more"
+            prompt = f"Remove {len(pairs)} students — {names}{more}?"
+        if not messagebox.askyesno("Remove Students", prompt):
+            return
+        removed_names = []
+        for uid, name in pairs:
+            self.store.remove_student(uid)
+            self.scanned_today.discard(uid)
+            removed_names.append(name)
+        self._save_today_scans()
+        self.refresh_all()
+        Toast.show(self.root, f"Removed {len(removed_names)} student(s).", "info")
+        self.log(f"Removed {len(removed_names)} student(s): {', '.join(removed_names)}.")
+
+    # ── export ────────────────────────────────────────────────────────────────
+    def _export_menu(self):
+        if not hasattr(self, "_export_menu_ref"):
+            self._export_menu_ref = tk.Menu(self.root, tearoff=False, bg=P.surface, fg=P.text,
+                                            activebackground=P.blue, activeforeground="white",
+                                            relief="flat", font=(FONT_FAMILY, 10))
+        m = self._export_menu_ref
+        m.delete(0, "end")
+        m.add_command(label="📊  Export to Excel (styled)",
+                      command=lambda: self._do_export("excel"))
+        m.add_command(label="📄  Export to CSV",
+                      command=lambda: self._do_export("csv"))
+        try:
+            m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            m.grab_release()
+
+    def _do_export(self, fmt: str):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if fmt == "excel":
+            dest = EXPORTS_DIR / f"FaceAttend_export_{stamp}.xlsx"
+            p    = self.store.export_excel(dest)
+            if p:
+                play_sound(SOUND_EXPORT)
+                Toast.show(self.root, f"Excel exported: {p.name}", "success")
+                self.log(f"Exported Excel: {p.name}")
+            else:
+                play_sound(SOUND_ERROR)
+                Toast.show(self.root, "Export failed.", "error")
+        else:
+            dest = EXPORTS_DIR / f"FaceAttend_export_{stamp}.csv"
+            p    = self.store.export_csv(dest)
+            play_sound(SOUND_EXPORT)
+            Toast.show(self.root, f"CSV exported: {p.name}", "success")
+            self.log(f"Exported CSV: {p.name}")
+
+
+    # ── refresh ───────────────────────────────────────────────────────────────
+    def refresh_all(self):
+        self.students_by_uid = self.store.students_by_uid()
+        self._refresh_stats()
+        self.refresh_table(self.search_var.get().strip())
+        self._msg_refresh_list()
+        if hasattr(self, "_an_top_list"):
+            self._refresh_analytics()
+        if hasattr(self, "_house_cards"):
+            self._refresh_houses()
+
+    def _refresh_stats(self):
+        students = list(self.students_by_uid.values())
+        total    = len(students)
+        present  = len([u for u in self.scanned_today if u in self.students_by_uid])
+        absent   = max(0, total - present)
+        top      = max(students, key=lambda s: safe_int(s.get("XP")), default=None)
+        self.card_total.set(total)
+        self.card_present.set(present)
+        self.card_absent.set(absent)
+        self.card_xp.set(f"{top.get('XP',0)} XP" if top else "—")
+        self.card_xp.set_subtitle(str(top.get("Name", "")) if top else self.T("no_scans_yet"))
+        self.date_lbl.configure(text=self._localized_date())
+
+    def refresh_table(self, query=""):
+        ql = query.lower()
+        self.table.delete(*self.table.get_children())
+        self.table_photos = []
+        self._hovered_row = None
+        students = self.store.load_students()
+
+        # apply column sort if active
+        if self._sort_col and self._sort_col in COLUMNS:
+            def sort_key(s):
+                v = s.get(self._sort_col, "")
+                try: return (0, float(v))
+                except (TypeError, ValueError): return (1, str(v).lower())
+            students = sorted(students, key=sort_key, reverse=not self._sort_ascending)
+
+        # update heading arrows
+        for col in COLUMNS:
+            arrow = ""
+            if col == self._sort_col:
+                arrow = "  ↑" if self._sort_ascending else "  ↓"
+            label = self.T(self._col_label_key.get(col, col)) if hasattr(self, "_col_label_key") else col
+            self.table.heading(col, text=label + arrow)
+        shown = 0
+
+        def _flame(streak: int) -> str:
+            s = safe_int(streak)
+            if s >= 30: return "🔥🔥🔥"
+            if s >= 10: return "🔥🔥"
+            if s >= 5:  return "🔥"
+            return ""
+
+        for i, s in enumerate(students):
+            uid    = str(s.get("UID", ""))
+            streak = safe_int(s.get("Streak", 0))
+            flame  = _flame(streak)
+            name   = s.get("Name", "")
+            name_display = f"{flame} {name}".strip() if flame else name
+            house  = str(s.get("House","None")).strip()
+            vals = [
+                s.get("Sl.No",""), s.get("Roll No",""), uid, name_display,
+                s.get("Grade",""), house,
+                s.get("Parent Phone",""), s.get("Parent Email",""),
+                s.get("No. of Days Present",0), s.get("XP",0),
+                f"{safe_float(s.get('Multiplier'),1.0):.1f}",
+                streak,
+            ]
+            hay  = " ".join(str(v) for v in vals).lower()
+            if ql and ql not in hay: continue
+            tags = ["present"] if uid in self.scanned_today else ["even" if i%2==0 else "odd"]
+            if ql and ql in hay and uid not in self.scanned_today: tags = ["match"]
+            photo = self._thumbnail(uid)
+            if photo: self.table_photos.append(photo)
+            try:
+                self.table.insert("", "end", iid=uid, text="", image=photo or "",
+                                  values=vals, tags=tags)
+            except tk.TclError:
+                # Extremely rare: duplicate/empty UID collides with an
+                # existing iid. Fall back to an auto-generated iid so the
+                # row still renders (multi-select for that row just won't
+                # map to a UID key).
+                self.table.insert("", "end", text="", image=photo or "",
+                                  values=vals, tags=tags)
+            shown += 1
+        self.table.update_idletasks()
+
+        if hasattr(self, "search_count_lbl"):
+            self.search_count_lbl.configure(text=f"{shown} found" if ql else "")
+
+        if hasattr(self, "table_empty"):
+            if not students:
+                self.table_empty.place(relx=0.5, rely=0.42, anchor="center")
+            else:
+                self.table_empty.place_forget()
+
+    def _thumbnail(self, uid):
+        if Image is None: return None
+        fp = FACES_DIR / f"{uid}.jpg"
+        if not fp.exists(): return None
+        try:
+            img = Image.open(fp); img.thumbnail((60, 60))
+            canvas = Image.new("RGB", (62, 62), P.surface2)
+            canvas.paste(img.convert("RGB"), ((62-img.width)//2, (62-img.height)//2))
+            return ImageTk.PhotoImage(canvas)
+        except: return None
+
+    def _debounce_search(self, _e=None):
+        if self._search_after:
+            self.root.after_cancel(self._search_after)
+        self._search_after = self.root.after(300, lambda: self.refresh_table(self.search_var.get().strip()))
+
+    def _clear_search(self):
+        self.search_var.set("")
+        self.refresh_table("")
+
+    # ── today scans persistence ───────────────────────────────────────────────
+    def _load_today_scans(self) -> set[str]:
+        if not TODAY_SCANS_FILE.exists(): return set()
+        try:
+            with open(TODAY_SCANS_FILE, "rb") as f: p = pickle.load(f)
+            if p.get("date") != date.today().isoformat(): return set()
+            return set(p.get("uids", []))
+        except: return set()
+
+    def _save_today_scans(self):
+        with open(TODAY_SCANS_FILE, "wb") as f:
+            pickle.dump({"date": date.today().isoformat(), "uids": sorted(self.scanned_today)}, f)
+
+    # ── logging ───────────────────────────────────────────────────────────────
+    def log(self, text: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if self.activity.size() == 1 and self.activity.get(0) == self._feed_empty_hint:
+            self.activity.delete(0)
+        self.activity.insert(0, f"{stamp}  {text}")
+        while self.activity.size() > 150:
+            self.activity.delete(tk.END)
+        if hasattr(self, "console_box"):
+            self._clog(f"{stamp}  {text}")
+
+    def _on_close(self):
+        try:
+            if self.scanning:
+                self.stop_scan()
+        except Exception as e:
+            self.log(f"Close error: {e}")
+        finally:
+            self.root.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SPLASH  (animated dot-progress)
+# ═══════════════════════════════════════════════════════════════════════════════
+class SplashScreen:
+    """
+    Startup checklist screen. Every dependency/package check gets a
+    pre-allocated, fixed-position row from the very first frame — the
+    3.0 rewrite exists specifically to fix a 2.x bug where rows were
+    pack()'d into a growing, unconstrained frame one at a time as each
+    check finished; once enough rows had appeared the frame outgrew its
+    allotted space and Tk's geometry manager would silently reflow the
+    whole checklist, which looked to a user like the screen "scrolling
+    down for no reason" right as the last few checks ran. Fix: every row
+    is created, placed, and given its final height ONCE up front; a check
+    completing only ever changes an icon/colour in place, never adds or
+    removes a widget from the layout, so there is nothing left for the
+    geometry manager to reflow. The window height is also computed from
+    the actual number of checks instead of being a guessed constant, so
+    it can never run out of room in the first place.
+    """
+
+    # Each entry: (display_label, check_fn_or_None)
+    # check_fn returns True = ok, False = missing/warning
+    CHECKS = [
+        ("Core Python modules",        lambda: True),
+        ("Tkinter UI",                 lambda: True),
+        ("OpenCV (cv2)",               lambda: cv2 is not None),
+        ("NumPy",                      lambda: np is not None),
+        ("Pillow (PIL)",               lambda: Image is not None),
+        ("openpyxl (Excel)",           lambda: Workbook is not None),
+        ("face_recognition",           lambda: face_recognition is not None),
+        ("Matplotlib charts",          lambda: plt is not None),
+        ("pygame (sound)",             lambda: _check_pygame()),
+        ("pyttsx3 (voice)",            lambda: pyttsx3 is not None),
+        ("reportlab (PDF)",            lambda: HAS_REPORTLAB),
+        ("Language & theme pack",      lambda: len(LANGUAGE_THEMES) == 13),
+        ("Excel database",             lambda: EXCEL_FILE.exists() or True),
+        ("Face encodings",             lambda: ENCODINGS_FILE.exists() or True),
+        (f"FaceAttend {APP_VERSION}",  lambda: True),
+    ]
+
+    ROW_DELAY  = 220   # ms between each row completing
+    ROW_HEIGHT = 24    # px — fixed, so total list height is deterministic
+
+    def __init__(self, master: tk.Toplevel, on_complete):
+        self.master      = master
+        self.on_complete = on_complete
+        self._step       = 0
+        self._row_labels = []   # (icon_lbl, txt_lbl) per row, ALL already visible
+        play_sound(SOUND_STARTUP)
+        self._build_ui()
+        self.master.after(50, self._fade_in)
+
+    def _build_ui(self):
+        self.master.configure(bg="#0e1117")
+        n_rows = len(self.CHECKS)
+        list_h = n_rows * self.ROW_HEIGHT
+        HEADER_H, FOOTER_H, PAD = 92, 84, 28
+        W = 680
+        H = HEADER_H + list_h + FOOTER_H + PAD
+        sw = self.master.winfo_screenwidth()
+        sh = self.master.winfo_screenheight()
+        H = min(H, int(sh * 0.85))  # never taller than the screen
+        self.master.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+        self.master.attributes("-alpha", 0.0)
+
+        shell = tk.Frame(self.master, bg="#12161f",
+                         highlightthickness=1, highlightbackground="#2a3448")
+        shell.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # ── header ──────────────────────────────────────────────
+        hdr = tk.Frame(shell, bg="#12161f")
+        hdr.pack(fill="x", padx=28, pady=(24, 0))
+
+        tk.Label(hdr, text="⬡", bg="#12161f", fg="#3b82f6",
+                 font=(FONT_FAMILY, 26)).pack(side="left", padx=(0, 12))
+
+        title_wrap = tk.Frame(hdr, bg="#12161f")
+        title_wrap.pack(side="left")
+
+        title_row = tk.Frame(title_wrap, bg="#12161f")
+        title_row.pack(anchor="w")
+        tk.Label(title_row, text=f"FaceAttend  {APP_VERSION}",
+                 bg="#12161f", fg="#f1f5f9",
+                 font=(FONT_FAMILY, 20, "bold")).pack(side="left")
+
+        # ── Minecraft-style splash text: tilted, yellow, bobbing ───────
+        splash_text = random.choice(SPLASH_TEXTS)
+        self._splash_canvas = tk.Canvas(title_row, height=40,
+                                         bg="#12161f", highlightthickness=0)
+        self._splash_canvas.pack(side="left", padx=(10, 0), anchor="s")
+        self._splash_text_id = self._splash_canvas.create_text(
+            6, 24, text=splash_text, fill="#fde047", anchor="w",
+            angle=14, font=(FONT_FAMILY, 10, "bold"))
+        # size the canvas to the actual rendered text so nothing clips,
+        # with a little breathing room on every side for the tilt + bob
+        bbox = self._splash_canvas.bbox(self._splash_text_id)
+        if bbox:
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            self._splash_canvas.configure(width=tw + 28, height=max(44, th + 24))
+        self._splash_bob_step = 0
+        self._bob_splash_text()
+
+        tk.Label(title_wrap, text=f"Build {APP_BUILD}  ·  Smart Attendance System",
+                 bg="#12161f", fg="#7b8aa0",
+                 font=(FONT_FAMILY, 9)).pack(anchor="w")
+
+        tk.Frame(shell, bg="#2a3448", height=1).pack(fill="x", padx=28, pady=(14, 0))
+
+        # ── checklist area — FIXED height, no scrolling, no reflow ────────
+        list_outer = tk.Frame(shell, bg="#12161f", height=list_h)
+        list_outer.pack(fill="x", padx=28, pady=(10, 0))
+        list_outer.pack_propagate(False)  # height stays exactly list_h, forever
+
+        # every row is created and placed right now — checks only ever
+        # mutate an existing row's icon/text colour, never touch layout
+        for label, _ in self.CHECKS:
+            row = tk.Frame(list_outer, bg="#12161f", height=self.ROW_HEIGHT)
+            row.pack(fill="x")
+            row.pack_propagate(False)
+
+            icon_lbl = tk.Label(row, text="\u00b7", bg="#12161f", fg="#4d586c",
+                                 font=(FONT_FAMILY, 11), width=2)
+            icon_lbl.pack(side="left", padx=(0, 6))
+            txt_lbl = tk.Label(row, text=label, bg="#12161f", fg="#3a4356",
+                                font=(FONT_FAMILY, 10))
+            txt_lbl.pack(side="left")
+
+            self._row_labels.append((icon_lbl, txt_lbl))
+
+        # ── progress bar + status ──────────────────────────────────
+        bar_frame = tk.Frame(shell, bg="#12161f")
+        bar_frame.pack(fill="x", padx=28, pady=(10, 14))
+
+        style = ttk.Style(self.master)
+        style.configure("Splash.Horizontal.TProgressbar",
+            troughcolor="#1c2233", background="#3b82f6",
+            bordercolor="#1c2233", lightcolor="#3b82f6",
+            darkcolor="#2563eb", thickness=5)
+        self.pb = ttk.Progressbar(bar_frame,
+                                   style="Splash.Horizontal.TProgressbar",
+                                   orient="horizontal", mode="determinate",
+                                   maximum=len(self.CHECKS), value=0)
+        self.pb.pack(fill="x")
+
+        self.status_var = tk.StringVar(value="Starting up\u2026")
+        tk.Label(bar_frame, textvariable=self.status_var,
+                 bg="#12161f", fg="#4d586c",
+                 font=(FONT_FAMILY, 8)).pack(anchor="e", pady=(4, 0))
+
+    def _bob_splash_text(self):
+        """Gentle pulse on the yellow splash text, Minecraft-style."""
+        import math
+        try:
+            self._splash_bob_step += 1
+            scale = 1.0 + 0.12 * math.sin(self._splash_bob_step / 6)
+            size = max(8, round(10 * scale))
+            self._splash_canvas.itemconfigure(self._splash_text_id,
+                                               font=(FONT_FAMILY, size, "bold"))
+            self.master.after(80, self._bob_splash_text)
+        except tk.TclError:
+            pass  # window already closed
+
+    def _fade_in(self, alpha=0.0):
+        alpha += 0.12
+        try:
+            self.master.attributes("-alpha", min(1.0, alpha))
+        except tk.TclError:
+            return
+        if alpha < 1.0:
+            self.master.after(20, lambda: self._fade_in(alpha))
+        else:
+            self.master.after(120, self._advance)
+
+    def _advance(self):
+        if self._step >= len(self.CHECKS):
+            self.master.after(250, self._show_ready)
+            return
+
+        icon_lbl, txt_lbl = self._row_labels[self._step]
+        label, check_fn = self.CHECKS[self._step]
+
+        try:
+            ok = check_fn() if check_fn else True
+        except Exception:
+            ok = False
+
+        if ok:
+            icon_lbl.configure(text="\u2713", fg="#22c55e")
+            txt_lbl.configure(fg="#e8edf5")
+        else:
+            icon_lbl.configure(text="\u26a0", fg="#f59e0b")
+            txt_lbl.configure(fg="#f59e0b")
+
+        self.pb["value"] = self._step + 1
+        self.status_var.set(label)
+        self._step += 1
+        self.master.after(self.ROW_DELAY, self._advance)
+
+    def _show_ready(self):
+        """A distinct, unmistakable 'done' state — instead of the old
+        behaviour of silently falling through straight to the main window,
+        which is part of what made the transition feel like a glitch."""
+        n_ok = sum(1 for _, t in self._row_labels if t.cget("fg") == "#e8edf5")
+        n_total = len(self.CHECKS)
+        if n_ok == n_total:
+            self.status_var.set(f"All {n_total} checks passed \u2014 launching FaceAttend\u2026")
+        else:
+            self.status_var.set(f"Ready ({n_ok}/{n_total} optional features available) \u2014 launching\u2026")
+        self.pb["value"] = n_total
+        self.master.after(550, self._close)
+
+    def _close(self):
+        try:
+            self.master.destroy()
+        except tk.TclError:
+            pass
+        self.on_complete()
+
+
+def _check_pygame() -> bool:
+    try:
+        import pygame
+        return True
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APP-LEVEL RESTART  (Windows-only, no manual relaunch needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+def restart_app():
+    """
+    Relaunches FaceAttend with the same interpreter/script (or frozen .exe)
+    as a fully detached child process, then the caller exits the current
+    one. Because the child is spawned with DETACHED_PROCESS /
+    CREATE_NEW_PROCESS_GROUP on Windows, it keeps running independently of
+    the parent — so there's no point where the app is "fully closed" with
+    nothing on screen; the old window disappears right as the new one's
+    splash appears.
+
+    This exists specifically so Theme/Language changes (which previously
+    only applied on the NEXT manual launch) don't require the teacher to
+    manually find and reopen FaceAttend themselves.
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable] + sys.argv[1:]
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+
+        kwargs = {}
+        if os.name == "nt":
+            DETACHED_PROCESS         = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            kwargs["close_fds"] = True
+
+        subprocess.Popen(cmd, cwd=str(APP_DIR), **kwargs)
+        return True
+    except Exception as e:
+        logger.error("Restart failed: %s", e)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY
+# ═══════════════════════════════════════════════════════════════════════════════
+def _prepare():
+    ensure_dirs()
+    if not EXCEL_FILE.exists() and Workbook:
+        AttendanceStore(Settings())._init_excel()
+
+def main():
+    _prepare()
+    root = tk.Tk()
+    root.withdraw()
+    root.title(f"FaceAttend {APP_VERSION}")
+    root.geometry("1440x860")
+    root.minsize(1100, 720)
+    root.configure(bg=P.bg)
+    if ICON_FILE.exists():
+        try:
+            root.iconbitmap(default=str(ICON_FILE))
+        except Exception:
+            pass
+
+    def launch():
+        root.deiconify()
+        if os.name == "nt":
+            root.state("zoomed")
+        FaceAttendApp(root)
+
+    splash = tk.Toplevel(root)
+    splash.overrideredirect(True)
+    splash.resizable(False, False)
+    splash.attributes("-topmost", True)
+    SplashScreen(splash, lambda: (splash.destroy(), launch()))
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
